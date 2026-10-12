@@ -1,0 +1,172 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isReadOnlyCommand, gateToolCall, gateUnreadableState, allowedArtifactForPhase, pathIsExactly, resolveTarget } from "../../lib/gating.ts";
+import { newState, type RpacState } from "../../lib/schema.ts";
+import { join } from "node:path";
+
+const ROOT = "/work/proj";
+const WF = "w-abc12345";
+const REQ = join(ROOT, ".pi", "rpac", WF, "requirements.md");
+const PLAN = join(ROOT, ".pi", "rpac", WF, "plan.md");
+const APP = join(ROOT, "src", "app.ts");
+
+function state(phase: "refine" | "plan" | "act" | "consolidate"): RpacState {
+	const s = newState(ROOT, "demo");
+	s.id = WF;
+	s.phase = phase;
+	return s;
+}
+
+test("allowedArtifactForPhase maps refine→requirements, plan→plan, nothing else", () => {
+	assert.equal(allowedArtifactForPhase(ROOT, WF, "refine"), REQ);
+	assert.equal(allowedArtifactForPhase(ROOT, WF, "plan"), PLAN);
+	assert.equal(allowedArtifactForPhase(ROOT, WF, "act"), null);
+	assert.equal(allowedArtifactForPhase(ROOT, WF, "consolidate"), null);
+});
+
+// --- write/edit gating ------------------------------------------------------
+
+test("REFINE: writing the requirements artifact (absolute or cwd-relative) is allowed", () => {
+	const s = state("refine");
+	assert.equal(gateToolCall(s, ROOT, "write", { path: REQ, content: "x" }, ROOT), null);
+	assert.equal(gateToolCall(s, ROOT, "write", { path: `.pi/rpac/${WF}/requirements.md`, content: "x" }, ROOT), null);
+	// from a subdirectory cwd, the root-relative path still resolves to the artifact
+	const sub = join(ROOT, "sub");
+	assert.equal(gateToolCall(s, sub, "write", { path: join(ROOT, "sub", "..", ".pi", "rpac", WF, "requirements.md"), content: "x" }, ROOT), null);
+});
+
+test("REFINE: writing the plan artifact is blocked (only requirements allowed)", () => {
+	const s = state("refine");
+	const d = gateToolCall(s, ROOT, "write", { path: PLAN, content: "x" }, ROOT);
+	assert.ok(d?.block);
+	assert.match(d!.reason, /read-only/);
+});
+
+test("REFINE/PLAN: application write and edit are blocked", () => {
+	for (const phase of ["refine", "plan"] as const) {
+		const s = state(phase);
+		assert.ok(gateToolCall(s, ROOT, "write", { path: APP, content: "x" }, ROOT)?.block, `${phase} write blocked`);
+		assert.ok(gateToolCall(s, ROOT, "edit", { path: APP, edits: [] }, ROOT)?.block, `${phase} edit blocked`);
+		// the RPAC state index itself is not writable either (exact-allowlist, not a dir prefix)
+		assert.ok(gateToolCall(s, ROOT, "write", { path: join(ROOT, ".pi", "rpac", "state.json"), content: "x" }, ROOT)?.block);
+		assert.ok(gateToolCall(s, ROOT, "write", { path: join(ROOT, ".pi", "rpac", WF, "log.md"), content: "x" }, ROOT)?.block, "log.md is not a model-writable artifact");
+	}
+});
+
+test("PLAN: writing the plan artifact is allowed, requirements is not", () => {
+	const s = state("plan");
+	assert.equal(gateToolCall(s, ROOT, "write", { path: PLAN, content: "x" }, ROOT), null);
+	assert.ok(gateToolCall(s, ROOT, "edit", { path: REQ, edits: [] }, ROOT)?.block);
+});
+
+test("ACT/CONSOLIDATE: no gating at all (normal Pi permissions apply)", () => {
+	for (const phase of ["act", "consolidate"] as const) {
+		const s = state(phase);
+		assert.equal(gateToolCall(s, ROOT, "write", { path: APP, content: "x" }, ROOT), null);
+		assert.equal(gateToolCall(s, ROOT, "bash", { command: "git commit -m x" }, ROOT), null);
+	}
+});
+
+test("explicitly read-only tools pass through; unknown custom tools fail closed", () => {
+	for (const tool of ["read", "grep", "find", "ls", "codemode"]) {
+		assert.equal(gateToolCall(state("refine"), ROOT, tool, { path: APP }, ROOT), null, `${tool} unblocked`);
+	}
+	assert.ok(gateToolCall(state("refine"), ROOT, "custom_mutator", { path: APP }, ROOT)?.block);
+});
+
+test("the rpac tool itself is never gated", () => {
+	assert.equal(gateToolCall(state("refine"), ROOT, "rpac", { action: "refine_complete" }, ROOT), null);
+});
+
+test("unreadable RPAC state fails closed for mutation tools", () => {
+	assert.ok(gateUnreadableState("write")?.block);
+	assert.ok(gateUnreadableState("bash")?.block);
+	assert.ok(gateUnreadableState("custom_mutator")?.block);
+	assert.equal(gateUnreadableState("read"), null);
+	assert.equal(gateUnreadableState("rpac"), null);
+});
+
+// --- bash fail-closed read-only policy ---------------------------------------
+
+const SAFE: [string, string][] = [
+	["simple read", "cat src/app.ts"],
+	["grep", "grep -r todo src/"],
+	["ls", "ls -la"],
+	["find", "find . -name '*.ts'"],
+	["git status", "git status"],
+	["git diff", "git diff HEAD"],
+	["git log", "git log --oneline -5"],
+	["git rev-parse", "git rev-parse --short HEAD"],
+	["piped reads", "ls | grep foo | wc -l"],
+	["compound reads", "git status && git diff"],
+	["node --version", "node --version"],
+	["printenv", "printenv PATH"],
+];
+
+const BLOCKED: [string, string][] = [
+	["git commit", "git commit -m msg"],
+	["git add", "git add -A"],
+	["git push", "git push origin main"],
+	["git checkout", "git checkout main"],
+	["redirect", "echo hi > out.txt"],
+	["append redirect", "echo hi >> log.txt"],
+	["rm", "rm -rf build"],
+	["mv", "mv a b"],
+	["cp", "cp a b"],
+	["touch", "touch newfile"],
+	["mkdir", "mkdir foo"],
+	["sed -i", "sed -i 's/a/b/' f.txt"],
+	["npm install", "npm install lodash"],
+	["pip install", "pip install requests"],
+	["sudo", "sudo apt-get update"],
+	["unknown command (fail-closed)", "frobnicate --all"],
+	["node mutating", "node -e 'require(\"fs\").writeFileSync(\"x\",\"y\")'"],
+	["pipe to tee", "cat a | tee b"],
+	["curl -o", "curl -o out.html https://x"],
+	["curl POST", "curl -X POST https://x"],
+	["find delete", "find . -name '*.tmp' -delete"],
+	["find exec", "find . -exec touch marker {} ;"],
+	["env launches command", "env sh -c 'touch marker'"],
+	["awk system", "awk 'BEGIN { system(\"touch marker\") }'"],
+	["sort output", "sort -o out.txt in.txt"],
+	["git diff output", "git diff --output=changes.txt"],
+	["git remote add", "git remote add backup https://example.invalid/repo"],
+	["date set", "date --set tomorrow"],
+	["file compile", "file --compile magic"],
+	["npm list disallowed", "npm list"],
+	["sed disallowed", "sed -n '1,10p' file.txt"],
+	["substitution write", "echo $(date) > stamp.txt"],
+];
+
+test("bash policy: safe read-only commands are allowed", () => {
+	for (const [label, cmd] of SAFE) {
+		assert.equal(isReadOnlyCommand(cmd), true, `${label}: ${cmd}`);
+	}
+});
+
+test("bash policy: mutating commands are blocked (fail-closed)", () => {
+	for (const [label, cmd] of BLOCKED) {
+		assert.equal(isReadOnlyCommand(cmd), false, `${label}: ${cmd}`);
+	}
+});
+
+test("gate blocks mutating bash in refine/plan and allows read-only bash", () => {
+	const s = state("refine");
+	assert.ok(gateToolCall(s, ROOT, "bash", { command: "git commit -m x" }, ROOT)?.block);
+	assert.equal(gateToolCall(s, ROOT, "bash", { command: "git status" }, ROOT), null);
+	const s2 = state("plan");
+	assert.ok(gateToolCall(s2, ROOT, "bash", { command: "echo hi > out.txt" }, ROOT)?.block);
+});
+
+// --- path resolution helpers --------------------------------------------------
+
+test("pathIsExactly resolves cwd-relative and absolute targets to exactly the artifact", () => {
+	assert.equal(pathIsExactly(ROOT, REQ, REQ), true);
+	assert.equal(pathIsExactly(ROOT, `.pi/rpac/${WF}/requirements.md`, REQ), true);
+	assert.equal(pathIsExactly(ROOT, `.pi/rpac/${WF}/requirements.md.bak`, REQ), false);
+	assert.equal(pathIsExactly(ROOT, join(ROOT, ".pi", "rpac", WF, "..", "state.json"), REQ), false);
+});
+
+test("resolveTarget normalizes traversal", () => {
+	assert.equal(resolveTarget(ROOT, join(ROOT, "sub", "..", "src", "app.ts")), APP);
+});

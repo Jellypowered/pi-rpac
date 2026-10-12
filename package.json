@@ -1,0 +1,39 @@
+{
+  "name": "pi-rpac",
+  "version": "1.0.0",
+  "description": "RPAC (Refine \u2192 Plan \u2192 Act \u2192 Consolidate): a native Pi extension for a persistent, interactive, approval-gated coding workflow.",
+  "keywords": [
+    "pi-package",
+    "workflow",
+    "rpac",
+    "plan",
+    "extension"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/rpac.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"test/unit/*.test.ts\" \"test/e2e/*.test.ts\"",
+    "test:unit": "node --test \"test/unit/*.test.ts\"",
+    "test:e2e": "node --test \"test/e2e/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bash test/smoke/smoke.sh"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "typebox": "^1.0.0"
+  }
+}

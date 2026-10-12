@@ -1,0 +1,10 @@
+node_modules/
+
+# Local RPAC workflow state. Remove this rule if workflow state should be
+# version-controlled for team handoff.
+.pi/rpac/
+
+# Generated package archives, coverage, and npm debug logs.
+*.tgz
+coverage/
+npm-debug.log*
