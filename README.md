@@ -12,8 +12,8 @@ configured with (including local OpenAI-compatible models) and coexists with you
  ┌────────┐  approve  ┌─────┐  approve  ┌──────────────────────────┐  report  ┌──────┐
  │ REFINE │ ────────► │ PLAN│ ────────► │ ACT (one task per run)   │ ───────► │ DONE │
  │ what?  │  (user)   │ how? │  (user)  │ verify each task         │ (model)  │      │
- └────────┘           └─────┘          │ pause/abort/back-to-plan │         └──────┘
-                                       └──────────────────────────┘
+ └────────┘           └─────┘           │ pause/abort/back-to-plan │          └──────┘
+                                        └──────────────────────────┘
 ```
 
 ---
