@@ -1,6 +1,6 @@
 ---
 name: rpac-act
-description: RPAC act phase — execute one approved plan task from <state-dir>/plan.md: verify assumptions, implement minimally, run checks, report honestly. Use only when an RPAC act directive (from /rpac act) is active.
+description: RPAC act phase — execute one approved plan task from <state-dir>/plan.md — verify assumptions, implement minimally, run checks, report honestly. Use only when an RPAC act directive (from /rpac act) is active.
 ---
 
 # RPAC · Act

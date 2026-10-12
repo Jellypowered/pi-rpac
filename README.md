@@ -73,32 +73,68 @@ to run.
 ## Installation
 
 RPAC is a standard **Pi package** (a directory with a `pi` manifest exposing `extensions/` and
-`skills/`). Pi's native installer handles all of these.
+`skills/`). Pi's native installer handles all of these. You do **not** install it with
+`npm install -g`; `pi install` records the package in Pi's settings and loads both the extension
+and its skills.
 
-### From a local directory (development)
+### Does it work with my existing Pi extensions?
 
-From a checkout of this repo:
+Yes. A personal RPAC install is added alongside the extensions, skills, prompts, and themes you
+already use; it does not replace them or create a separate Pi environment. RPAC is dormant until
+you run `/rpac start` in a project, and its workflow state remains local to that project's git
+root.
+
+Two practical caveats:
+
+- Another extension must not claim the same `/rpac` command or `rpac` tool name.
+- While an RPAC workflow is in **REFINE** or **PLAN**, RPAC deliberately blocks mutating and
+  unknown custom tools to enforce read-only planning. Other extensions remain loaded, but one of
+  their tools may be refused during those phases. Normal Pi permissions apply again in **ACT**.
+
+If RPAC appears in both personal and project settings, Pi identifies equivalent package sources
+and avoids loading duplicate copies. A project declaration can override/filter the personal one.
+
+### From a local checkout (development)
+
+First clone this repository somewhere permanent. Then, in your regular shell—not inside an
+interactive Pi session—register that directory as a personal Pi package:
 
 ```bash
-cd /path/to/pi-rpac
-pi install ./          # local packages are loaded by path, not copied
-pi list                # confirms "pi-rpac" is configured
+git clone https://github.com/Jellypowered/pi-rpac.git /stuff/Source/pi-rpac
+pi install /stuff/Source/pi-rpac
+pi list                 # confirms "pi-rpac" is configured
 ```
 
-Because a local path is not copied, edits to `extensions/` or `lib/` are picked up on the next
-`/reload` or Pi restart.
-
-### User-level install from git
-
-Once the package is published, install its git source without `--local` to add it to your user
-settings (`~/.pi/agent/settings.json`) and make it available in every project:
+`pi install ./` is only shorthand for the same command when your shell's current directory is the
+checkout. You do not need to start interactive Pi there; `cd /path/to/pi-rpac` merely makes `./`
+resolve to that directory. After installation, start Pi in the project where you actually want to
+work:
 
 ```bash
-# Replace OWNER and the version with the published repository and release.
-pi install git:github.com/OWNER/pi-rpac@v1
+cd /path/to/your-project
+pi
 ```
 
-Until then, use the local-checkout instructions above.
+Pi records the checkout's absolute path in your personal settings; it does not copy the package.
+Keep the checkout in place. Edits or `git pull` updates to `extensions/`, `lib/`, or `skills/` are
+picked up after `/reload` or a Pi restart.
+
+### User-level ("global") install
+
+In Pi, a global install is called a **personal** or **user-level** install. Install without
+`--local`; this adds RPAC to `~/.pi/agent/settings.json` and makes it available in every project:
+
+```bash
+pi install git:github.com/Jellypowered/pi-rpac
+pi list
+```
+
+After release tags are available, pin one when you need reproducible installs, for example
+`git:github.com/Jellypowered/pi-rpac@<tag>`. If the package is published to npm, the equivalent
+will be `pi install npm:pi-rpac@<version>`; this is a Pi package install, not `npm install -g`.
+
+A personal install does not create workflows in every repository. It only makes `/rpac`
+available; workflow state is created when you explicitly run `/rpac start`.
 
 ### Project-level install
 
@@ -144,6 +180,75 @@ those critical sections are synchronous and short. The ACT execution lease is ta
 when its holder process is provably dead; age alone never displaces a live ACT executor.
 
 There is no separate provider/model configuration — RPAC uses whatever model Pi is running.
+
+---
+
+## Quick start: your first RPAC workflow
+
+You interact with RPAC through `/rpac` commands in a normal interactive Pi session. You do not
+invoke the `rpac` model tool or load the phase skills yourself—RPAC directs the model and the
+model records progress automatically.
+
+This example fixes a small bug from start to finish:
+
+1. **Open the project in Pi.**
+
+   ```bash
+   cd /path/to/your-project
+   pi
+   ```
+
+2. **Describe the outcome you want.** Be specific about the behavior, not the implementation.
+
+   ```text
+   /rpac start Fix the settings form so an invalid port shows an inline error instead of submitting
+   ```
+
+   RPAC creates `.pi/rpac/<workflow-id>/`, captures the current git baseline, and asks the model
+   to inspect the repository. The model may ask clarifying questions, then writes
+   `requirements.md`. No application code can be changed in this phase.
+
+3. **Review the requirements and move to planning.** Answer any questions, inspect the artifact
+   path shown by `/rpac status`, then run:
+
+   ```text
+   /rpac plan
+   ```
+
+   Approve the requirements in the dialog (or use `/rpac approve requirements` without a TUI).
+   The model creates `plan.md` and a concrete task list. Review it and approve the plan when
+   prompted; the headless equivalent is `/rpac approve plan`.
+
+4. **Execute the plan.**
+
+   ```text
+   /rpac act
+   ```
+
+   By default this executes and verifies one task, then stops so you can inspect the result. Run
+   `/rpac act` again for each remaining task. Use `/rpac status` at any point to see what is done,
+   pending, blocked, or failed. For a trusted plan, `/rpac act --sequential` can run all ready
+   tasks after a separate confirmation.
+
+5. **Verify the whole change and get the report.**
+
+   ```text
+   /rpac consolidate
+   ```
+
+   The model checks the implementation against the approved requirements, reviews the diff, runs
+   final checks, and writes `report.md`. Read the report and inspect the code before committing;
+   RPAC never commits or publishes changes.
+
+The everyday loop is therefore:
+
+```text
+/rpac start <goal>  →  answer questions  →  /rpac plan  →  approve plan
+                    →  /rpac act (repeat) →  /rpac consolidate
+```
+
+If you close Pi midway, return to the same repository and run `/rpac status`, then `/rpac resume`.
+Use `/rpac list` and `/rpac resume <id>` when the repository contains multiple saved workflows.
 
 ---
 
