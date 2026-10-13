@@ -22,9 +22,10 @@ Useful concepts **reused** (adapted, attributed in README — no code copied):
   uncertainty separated.
 - Artifacts carry *verified codebase facts* (pinned to a commit) and an *overrides/deviations*
   section; deviations are logged the moment they are settled.
-- One task per execution cycle; a task completes only after verification ran. Failures and
-  unavailable checks are reported, never silently absorbed — in v2 they make the task
-  **failed**, not done. No scope expansion, never commit/push automatically.
+- One task per execution cycle; a task completes only after verification ran. Failing or
+  unavailable acceptance checks make the task **failed**, not done; non-blocking observations
+  preserve audit findings without conflating subject failure with workflow failure. No scope
+  expansion, never commit/push automatically.
 - Consolidation/handover writes a self-contained summary for a reviewer/next session holding
   nothing but the diff.
 
@@ -104,8 +105,8 @@ pi-rpac/
 ```
 
 Machine state (`workflow.json`) carries: id, task, phase, `approvals {requirements, plan,
-sequential}`, current `tasks [{id, title, dependsOn?, status, verification?, issues?,
-acceptedException?}]`, bounded `taskHistory` for completed evidence from superseded plans,
+sequential}`, current `tasks [{id, title, dependsOn?, status, verification?, deliverables?,
+issues?, acceptedException?}]`, bounded `taskHistory` for completed evidence from superseded plans,
 artifact refs + sha256, git baseline, checkpoints, bounded event log (last 50), and `paused`.
 
 Rules:
@@ -161,9 +162,11 @@ idle → refine ─(req approved)→ plan ─(plan approved)→ act ─→ conso
 
 Task statuses: `pending → in_progress → done | failed | blocked | interrupted`.
 
-- `task_done` **requires ≥1 verification check** and passes only when **every** check is
-  `pass`; a `fail` or `unavailable` check leaves the task `failed` with the issues recorded
-  (never `done`). `task_fail` records an explicit failure; `task_block`/`task_unblock` manage
+- `task_done` **requires ≥1 acceptance check** and passes only when every acceptance check is
+  `pass`; a failing/unavailable acceptance check leaves the task `failed`. Observation checks
+  preserve actual audit outcomes without deciding task success. Optional task `deliverables` are
+  hashed, persisted, and included in stale checks/status/handoff. `task_fail` records an explicit
+  failure; `task_block`/`task_unblock` manage
   prerequisite blocks (a blocked task cannot be started).
 - A model run that ends with a task still `in_progress` (the `agent_end` event) marks it
   `interrupted` — an honest outcome distinct from failure; `interrupted` (and `failed`,
@@ -191,8 +194,9 @@ tool calls **before execution** (`lib/gating.ts`):
   of a pipeline/list must be allowed; redirection and mutation-capable variants such as
   `find -delete/-exec`, `git remote add`, output-file options, interpreters, package managers,
   and network clients are blocked.
-- Known inspection tools (`read`, `grep`, `find`, `ls`) and `codemode` pass; nested tool calls
-  made by `codemode` are gated independently. Any other custom tool is blocked. ACT and
+- Known inspection tools (`read`, `grep`, `find`, `ls`), `codemode`, and the non-mutating
+  `ask_user_question` tool pass; nested tool calls made by `codemode` are gated independently.
+  Any other custom tool is blocked. ACT and
   consolidate run under normal Pi permissions.
 - The gate reads state lock-less (`peekActive`) so it adds no latency and never takes tool
   execution down with it (errors are swallowed; blocking decisions are the only output).
@@ -222,7 +226,8 @@ tool calls **before execution** (`lib/gating.ts`):
 
 ### 2.6 Stale detection (`/rpac status`, `/rpac resume`, on `act`)
 
-- Artifact sha256 mismatch since approval → "changed since approval; re-review" warning.
+- Requirements/plan sha256 mismatch since approval and registered task-deliverable mismatch or
+  deletion → stale warning.
 - Git HEAD moved since baseline / baseline-dirty files changed / new uncommitted files →
   divergence warning. `.pi/` paths are excluded (RPAC's own state churn is expected and
   summarized separately).

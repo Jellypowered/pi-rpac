@@ -73,7 +73,14 @@ test("validateState round-trips all task statuses and recorded evidence", () => 
 	const s = validateState(
 		base({
 			tasks: [
-				{ id: 1, title: "a", status: "done", doneAt: "2026-01-02T00:00:00Z", verification: [{ name: "t", result: "pass" }] },
+				{
+					id: 1,
+					title: "a",
+					status: "done",
+					doneAt: "2026-01-02T00:00:00Z",
+					verification: [{ name: "lint", kind: "observation", result: "fail" }, { name: "report", kind: "acceptance", result: "pass" }],
+					deliverables: [{ path: "review.md", sha256: "ab".repeat(32), updatedAt: "2026-01-02T00:00:00Z" }],
+				},
 				{ id: 2, title: "b", status: "failed", issues: ["check x failed"] },
 				{ id: 3, title: "c", status: "interrupted" },
 				{ id: 4, title: "d", status: "blocked" },
@@ -95,6 +102,8 @@ test("validateState round-trips all task statuses and recorded evidence", () => 
 		PROJECT,
 	);
 	assert.equal(s.tasks.length, 6);
+	assert.equal(s.tasks[0]!.verification?.[0]?.kind, "observation");
+	assert.equal(s.tasks[0]!.deliverables?.[0]?.path, "review.md");
 	assert.equal(s.tasks[1]!.status, "failed");
 	assert.equal(s.tasks[2]!.status, "interrupted");
 	assert.equal(s.tasks[5]!.acceptedException, "user accepted flaky e2e");

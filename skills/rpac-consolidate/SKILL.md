@@ -20,7 +20,12 @@ success.
    ones the act phase used, plus anything the requirements' AC names as manual.
 4. **Cross-check the decisions log.** Read `<state-dir>/log.md`: every deviation and decision
    should be visible in the diff or the code. Anything missing is a finding.
-5. **Write the report** to `<state-dir>/report.md` (structure below).
+5. **Audit produced reports.** When a task's deliverable is itself a review, audit, or findings
+   report, verify its internal claims before declaring success: recalculate severity/status counts;
+   ensure every summary item maps to one detailed item and every detailed item has one classification;
+   verify introduced/pre-existing/environmental/non-issue labels against the baseline; and ensure the
+   completion report agrees with the primary deliverable. Contradictions are genuine problems.
+6. **Write the report** to `<state-dir>/report.md` (structure below).
 
 ## Report: `<state-dir>/report.md`
 

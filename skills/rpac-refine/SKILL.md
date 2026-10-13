@@ -24,6 +24,9 @@ Every requirement is checked against the actual code, config, and docs:
   other names. "Not found under the name used" is not "not present".
 - Verify both sides of an integration: if a requirement relies on another component behaving a
   certain way, open that component and confirm.
+- Requirements about states such as enabled/disabled, started/stopped, authenticated/unauthenticated,
+  or connected/disconnected cover both initial state and transitions. Inspect reload/reconfiguration,
+  teardown, stale-state cleanup, and re-entry paths rather than proving only the startup default.
 - If the task says "reuse X" / "X already exists", find what is behind X and anchor the
   requirement on the smallest extension. Reuse-vs-build-new is a **blocking** question for the
   user when the code cannot settle it — never a silent default.

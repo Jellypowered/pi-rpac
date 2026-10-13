@@ -8,6 +8,7 @@
 import {
 	type RpacState,
 	type RpacTask,
+	type RpacArtifact,
 	type VerificationCheck,
 	isSubstantive,
 	validateTaskGraph,
@@ -319,7 +320,7 @@ function collectIssues(verification: VerificationCheck[], deviations?: string[])
 	const issues: string[] = [];
 	for (const c of verification) {
 		if (c.result !== "pass") {
-			issues.push(`check "${c.name}" ${c.result}${c.detail ? `: ${c.detail}` : ""}`);
+			issues.push(`${c.kind === "observation" ? "observation" : "check"} "${c.name}" ${c.result}${c.detail ? `: ${c.detail}` : ""}`);
 		}
 	}
 	for (const d of deviations ?? []) {
@@ -329,9 +330,11 @@ function collectIssues(verification: VerificationCheck[], deviations?: string[])
 }
 
 /**
- * Mark a task complete. Verification is mandatory: at least one check, and
- * every check must be `pass` for the task to become `done`. A failing or
- * unavailable check leaves the task `failed` with the checks recorded — a
+ * Mark a task complete. Verification is mandatory: at least one acceptance
+ * check, and every acceptance check must be `pass` for the task to become
+ * `done`. Observation checks record the audited subject's outcome without
+ * deciding task completion. A failing or unavailable acceptance check leaves
+ * the task `failed` with the checks recorded — a
  * resumable, non-done outcome — unless the user later runs
  * `/rpac accept <id> <reason>` to accept a documented exception.
  */
@@ -340,6 +343,7 @@ export function taskDone(
 	ref: number | string,
 	verification: VerificationCheck[],
 	deviations?: string[],
+	deliverables?: RpacArtifact[],
 ): MachineResult {
 	requirePhase(s, ["act"], "task_done");
 	requireNotPaused(s, "to finish a task");
@@ -357,9 +361,14 @@ export function taskDone(
 	if (task.status !== "in_progress") {
 		throw new RpacGuardError(`task ${task.id} is ${task.status}, not in_progress — start it first (task_start)`);
 	}
+	const acceptance = verification.filter((c) => c.kind !== "observation");
+	if (acceptance.length === 0) {
+		throw new RpacGuardError("task_done requires at least one acceptance check; observations alone describe the audited subject but do not verify task completion");
+	}
 	const issues = collectIssues(verification, deviations);
-	const failures = verification.filter((c) => c.result !== "pass");
+	const failures = acceptance.filter((c) => c.result !== "pass");
 	task.verification = verification;
+	if (deliverables?.length) task.deliverables = deliverables;
 
 	if (failures.length > 0) {
 		task.status = "failed";
@@ -383,7 +392,7 @@ export function taskDone(
 		task.issues = issues;
 		pushEvent(s, "task_issues", `task ${task.id}: ${issues.join("; ")}`);
 	}
-	pushEvent(s, "task_done", `task ${task.id} done (${verification.map((c) => c.result).join("/")})`);
+	pushEvent(s, "task_done", `task ${task.id} done (${verification.map((c) => `${c.kind === "observation" ? "observation:" : ""}${c.result}`).join("/")})`);
 	addCheckpoint(s, `task ${task.id} complete: ${task.title}`);
 
 	const remaining = s.tasks.filter((t) => t.status === "pending" || t.status === "in_progress");

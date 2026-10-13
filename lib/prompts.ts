@@ -47,7 +47,7 @@ export function actDirective(
 Task: ${task}
 Plan: \`${planRel}\` (approved). Task #${taskId}: ${taskTitle}
 
-Read and follow the \`rpac-act\` skill. Verify assumptions against the code first, make only the necessary changes, run the applicable checks/tests, report results honestly, and call the \`rpac\` tool with action "task_done" (verification required — a task is done only when its checks pass; failing checks leave it failed, and blocked work uses "task_block").
+Read and follow the \`rpac-act\` skill. Task #${taskId} is already in progress under this execution lease — do not call \`task_start\` for it. Verify assumptions against the code first, make only the necessary changes, run the applicable checks/tests, report results honestly, and call the \`rpac\` tool with action "task_done" (verification required — a task is done only when its acceptance checks pass; audit observations may record subject failures without failing the task, and blocked work uses "task_block").
 Do not expand scope. Do not commit/push. Record deviations with action "deviation".${sequential ? "" : " Stop after this task; the user runs /rpac act again for the next one."}`;
 }
 

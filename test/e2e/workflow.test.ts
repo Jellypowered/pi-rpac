@@ -184,6 +184,8 @@ test("full two-task flow: repeated non-sequential /rpac act through done", async
 	assert.equal(resumeLease.workflowId, state().id, "resume holds a workflow-bound ACT lease");
 	assert.equal(resumeLease.taskId, 1, "resume lease identifies the resumed task");
 	assert.match(m.userMessages.at(-1)!, /resume — check what is already done/);
+	const duplicateStart = await rpacTool(m, repo, { action: "task_start", task: 1 });
+	assert.match(duplicateStart, /already in progress/, "current task_start is idempotent in one-task mode too");
 	// the model finishes task 1 within this run, then the run ends
 	let out = await rpacTool(m, repo, { action: "task_done", task: 1, verification: [{ name: "unit", result: "pass" }] });
 	assert.match(out, /Task 1\/2 complete/);
@@ -315,8 +317,31 @@ test("sequential execution continues only after a verified pass", async () => {
 	await rpacCmd(m, repo, "approve sequential");
 
 	await rpacCmd(m, repo, "act");
-	const out = await rpacTool(m, repo, { action: "task_done", task: 1, verification: [{ name: "check", result: "pass" }] });
+	const deliverable = join(repo, ".pi", "rpac", activeWorkflowId(repo), "review.md");
+	writeFileSync(deliverable, "# Review\n\nVerified output.\n", "utf8");
+	const duplicate = await rpacTool(m, repo, { action: "task_start", task: 1 });
+	assert.match(duplicate, /already in progress/, "repeating the task started by /rpac act is harmless");
+	assert.equal(state().events.filter((e: { kind: string; detail: string }) => e.kind === "task_start" && /task 1:/.test(e.detail)).length, 1, "duplicate start records no restart event");
+	const outside = await rpacTool(m, repo, {
+		action: "task_done",
+		task: 1,
+		verification: [{ name: "check", result: "pass" }],
+		deliverables: [join(repo, "..", "outside.md")],
+	});
+	assert.match(outside, /deliverable must be a file inside the project/);
+	assert.equal(state().tasks[0]!.status, "in_progress", "invalid deliverable leaves task untouched");
+	const out = await rpacTool(m, repo, {
+		action: "task_done",
+		task: 1,
+		verification: [{ name: "check", result: "pass" }],
+		deliverables: [deliverable],
+	});
 	assert.match(out, /Continue with the next ready task/, "verified pass continues sequential mode");
+	assert.equal(state().tasks[0]!.deliverables?.[0]?.path, `.pi/rpac/${activeWorkflowId(repo)}/review.md`);
+	assert.equal(state().tasks[0]!.deliverables?.[0]?.sha256, sha256File(deliverable));
+	writeFileSync(deliverable, "changed after task completion\n", "utf8");
+	const deliverableStatus = await rpacCmd(m, repo, "status");
+	assert.match(deliverableStatus.ui.text("info").at(-1)!, /task 1 deliverable changed/, "status detects stale registered output");
 	// the model continues within the run: task 2 starts (simulating the model's next task_start)
 	const s2 = await rpacTool(m, repo, { action: "task_start", task: 2 });
 	assert.match(s2, /Started task 2/);
@@ -418,6 +443,10 @@ test("REFINE/PLAN gate: application writes and mutating bash are blocked, artifa
 	assert.equal((r as { block?: boolean })?.block, undefined, "grep allowed");
 	r = await gate("read", { path: appAbs });
 	assert.equal((r as { block?: boolean })?.block, undefined, "read always allowed");
+	r = await gate("ask_user_question", { questions: [] });
+	assert.equal((r as { block?: boolean })?.block, undefined, "clarification questions are read-only");
+	r = await gate("bash", { command: `git -C ${repo} merge-base HEAD main 2>/dev/null` });
+	assert.equal((r as { block?: boolean })?.block, undefined, "real-world read-only git form allowed");
 
 	// plan phase: complete refine (artifact written first so the transition is valid)
 	writeArtifact(repo, "requirements", SUBSTANTIVE_REQ, wfId);

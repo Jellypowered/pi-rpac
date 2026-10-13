@@ -44,8 +44,8 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade|full-upgrade)\b/i,
 	/\b(dnf|yum)\s+(install|remove|erase|update|upgrade)\b/i,
 	/\bbrew\s+(install|uninstall|upgrade|remove)\b/i,
-	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|branch\s+(-[dD]\b|\w)|stash|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree)\b/i,
-	/\bgit\s+config\b/i,
+	/\bgit\s+(?:(?:add|commit|push|pull|merge|rebase|reset|checkout|switch|stash|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree)(?=\s|$)|branch\s+(?:-[dD]\b|\w))/i,
+	/\bgit\s+config\b(?!\s+--get(?:\s|$))/i,
 	/\bsudo\b/,
 	/\bsu\s+(-|\w)/,
 	/\bkill(all)?\b/,
@@ -74,6 +74,7 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*find\b/,
 	/^\s*ls\b/,
 	/^\s*pwd\b/,
+	/^\s*cd(?:\s|$)/,
 	/^\s*echo\b/,
 	/^\s*printf\b/,
 	/^\s*wc\b/,
@@ -106,9 +107,9 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*realpath\b/,
 	/^\s*readlink\b/,
 	/^\s*xargs\s+(grep|ls|stat|file|wc|du|md5sum|sha256sum)\b/,
-	/^\s*git\s+(status|log|diff|show|rev-parse|ls-files|shortlog|describe)(?:\s|$)/i,
+	/^\s*git\s+(status|log|diff|show|rev-parse|ls-files|shortlog|describe|merge-base|for-each-ref|name-rev)(?:\s|$)/i,
 	/^\s*git\s+remote(?:\s+-v)?\s*$/i,
-	/^\s*git\s+branch\s*$/i,
+	/^\s*git\s+branch(?:\s+(?:--list|-a|--all|-r|--remotes|--show-current|-v|-vv))*\s*$/i,
 	/^\s*git\s+config\s+--get(?:\s|$)/i,
 	/^\s*git\s+ls-/i,
 	/^\s*(node|deno|bun)\s+--(version|help)\b/i,
@@ -122,9 +123,73 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*false\b/,
 ];
 
-/** Strip leading env assignments and shell quoting noise for pattern checks. */
+/** Split an ordinary shell command list without treating quoted/escaped metacharacters as separators. */
+function shellSegments(command: string): string[] | null {
+	const segments: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | null = null;
+	let escaped = false;
+	const flush = () => {
+		if (current.trim()) segments.push(current.trim());
+		current = "";
+	};
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (escaped) {
+			current += ch;
+			escaped = false;
+			continue;
+		}
+		if (ch === "\\" && quote !== "'") {
+			current += ch;
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (quote === '"' && (ch === "`" || (ch === "$" && command[i + 1] === "("))) return null;
+			current += ch;
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		// Command/process substitution is intentionally outside the conservative policy.
+		if (ch === "`" || ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(")) return null;
+		if (ch === "&" && (current.endsWith(">") || command[i + 1] === ">")) {
+			current += ch;
+			continue;
+		}
+		if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
+			flush();
+			if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
+			continue;
+		}
+		current += ch;
+	}
+	if (quote || escaped) return null;
+	flush();
+	return segments;
+}
+
+/** Strip harmless output redirections used to suppress inspection noise. */
+function stripSafeRedirections(command: string): string {
+	return command
+		.replace(/(?:\d+|&)?\s*>\s*\/dev\/null\b/g, "")
+		.replace(/\d*\s*>\s*&\s*\d+\b/g, "")
+		.trim();
+}
+
+/** Normalize leading env assignments and read-only git global options. */
 function normalize(command: string): string {
-	return command.replace(/^(?:[A-Z_][A-Z0-9_]*=\S*\s+)+/, "").trim();
+	let result = command.replace(/^(?:[A-Z_][A-Z0-9_]*=\S*\s+)+/, "").trim();
+	const git = result.match(
+		/^git\s+(?:(?:-C\s+(?:"[^"]*"|'[^']*'|\S+)|--(?:no-pager|paginate|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs))\s+)+(.*)$/i,
+	);
+	if (git) result = `git ${git[1]}`;
+	return result;
 }
 
 /**
@@ -136,14 +201,13 @@ function normalize(command: string): string {
 export function isReadOnlyCommand(rawCommand: string): boolean {
 	const command = rawCommand.trim();
 	if (command === "") return true;
-	// Split on pipes, command lists, substitutions, && / || — every segment
-	// must itself be safe (and none may match a destructive pattern).
-	const segments = command.split(/\|\||&&|;|\||\$\(|\`\`|\`|`/).map((s) => s.trim()).filter(Boolean);
-	if (segments.length === 0) return false;
+	const segments = shellSegments(command);
+	if (!segments?.length) return false;
 	for (const seg of segments) {
-		const normalized = normalize(seg);
+		const withoutSafeRedirections = stripSafeRedirections(seg);
+		const normalized = normalize(withoutSafeRedirections);
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
-			if (pattern.test(normalized) || pattern.test(seg)) return false;
+			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) return false;
 		}
 		if (!SAFE_PATTERNS.some((p) => p.test(normalized))) return false;
 	}
@@ -168,7 +232,7 @@ export interface GateDecision {
 	reason: string;
 }
 
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "codemode"]);
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "codemode", "ask_user_question"]);
 
 /** Fail closed when RPAC files exist but active state cannot be validated. */
 export function gateUnreadableState(toolName: string): GateDecision | null {

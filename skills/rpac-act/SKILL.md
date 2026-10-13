@@ -5,11 +5,15 @@ description: RPAC act phase — execute one approved plan task from <state-dir>/
 
 # RPAC · Act
 
-One task per execution cycle (unless sequential mode was approved). Implement it, verify it,
-report it, stop. The plan (`<state-dir>/plan.md`) is the contract; the state
+One task per execution cycle (unless sequential mode was approved). `/rpac act` has already
+started the task named in the directive and marked it `in_progress`; do **not** call `task_start`
+for that current task. Implement it, verify it, report it, stop. In sequential mode, call
+`task_start` only after `task_done` succeeds, to advance to the next ready task. The plan
+(`<state-dir>/plan.md`) is the contract; the state
 (`<state-dir>/workflow.json`) tracks progress. Task outcomes are explicit:
 `pending → in_progress → done | failed | blocked`; a run that ends mid-task leaves it
-`interrupted`. A task is `done` only when **every** recorded verification check passed.
+`interrupted`. A task is `done` only when every recorded **acceptance** check passed; audit
+observations preserve subject failures without turning a successfully completed review into a failed task.
 
 ## Before touching code
 
@@ -36,24 +40,33 @@ Run the task's *Done when* check, then the validation the project's governing do
 than inventing a command. Fix what this task broke; a failure that predates the task or lands
 outside its scope is **reported, never fixed silently**.
 
-A task is done when its checks pass. **A failing or unavailable check does not complete the
-task** — it stays failed (resumable) until the problem is fixed and the checks pass, or the
-user explicitly accepts a documented exception (`/rpac accept <id> <reason>`). Never mark a
-task complete because code was generated.
+A task is done when its **acceptance** checks pass. **A failing or unavailable acceptance check
+does not complete the task** — it stays failed (resumable) until the problem is fixed and the
+checks pass, or the user explicitly accepts a documented exception (`/rpac accept <id> <reason>`).
+Never mark a task complete because code was generated.
+
+For audits and reviews, distinguish completing the review from what the reviewed subject did:
+a command that exposes an existing defect is an `observation` with its actual result (for example,
+`clang-format`: `fail`), plus a separate acceptance check that the result was accurately captured
+in the deliverable. Observation failures remain visible but do not fail the review task.
 
 ## Close
 
 Call `rpac` action `task_done` with:
 
 - `task`: the task id
-- `verification`: every check run, each `{name, result: pass|fail|unavailable, detail?}` —
-  including failures and unavailable checks
+- `verification`: every check run, each
+  `{name, kind?: acceptance|observation, result: pass|fail|unavailable, detail?}` — including
+  failures and unavailable checks; `kind` defaults to `acceptance`, and at least one acceptance
+  check is required
 - `deviations`: any deviations made (also recorded via the `deviation` action)
+- `deliverables`: every file this task intentionally produced (project-relative or absolute),
+  including reports under `<state-dir>`; RPAC hashes them and detects later changes or deletion
 
 Outcomes:
 
-- all checks pass → the task becomes `done`.
-- any check fails/unavailable → the task becomes `failed` (not done). Then either fix and
+- all acceptance checks pass → the task becomes `done`; observation failures stay recorded.
+- any acceptance check fails/unavailable → the task becomes `failed` (not done). Then either fix and
   re-run (`/rpac act <id>` — failed tasks are restartable) or use `task_fail` with the reason
   when the task cannot be completed at all. If sequential mode is on, a failed/blocked task
   stops the run.

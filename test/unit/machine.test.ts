@@ -239,6 +239,28 @@ test("task_done with a failing check leaves the task FAILED (not done)", () => {
 	assert.equal(s.tasks[0]!.status, "in_progress");
 });
 
+test("audit observations record subject failures without failing a verified review task", () => {
+	const s = approvedPlanState();
+	taskStart(s);
+	const res = taskDone(s, 1, [
+		{ name: "clang-format", kind: "observation", result: "fail", detail: "48 existing violations found" },
+		{ name: "review report captures tool output", kind: "acceptance", result: "pass" },
+	]);
+	assert.equal(s.tasks[0]!.status, "done");
+	assert.ok(s.tasks[0]!.issues?.some((i) => /observation.*clang-format.*fail/.test(i)));
+	assert.match(res.message, /complete.*observation/s);
+});
+
+test("observations alone cannot verify task completion", () => {
+	const s = approvedPlanState();
+	taskStart(s);
+	assert.throws(
+		() => taskDone(s, 1, [{ name: "lint", kind: "observation", result: "pass" }]),
+		(e: Error) => /at least one acceptance check/.test(e.message),
+	);
+	assert.equal(s.tasks[0]!.status, "in_progress");
+});
+
 test("task_done with an unavailable check leaves the task FAILED (not done)", () => {
 	const s = approvedPlanState();
 	taskStart(s);

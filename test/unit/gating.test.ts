@@ -68,7 +68,7 @@ test("ACT/CONSOLIDATE: no gating at all (normal Pi permissions apply)", () => {
 });
 
 test("explicitly read-only tools pass through; unknown custom tools fail closed", () => {
-	for (const tool of ["read", "grep", "find", "ls", "codemode"]) {
+	for (const tool of ["read", "grep", "find", "ls", "codemode", "ask_user_question"]) {
 		assert.equal(gateToolCall(state("refine"), ROOT, tool, { path: APP }, ROOT), null, `${tool} unblocked`);
 	}
 	assert.ok(gateToolCall(state("refine"), ROOT, "custom_mutator", { path: APP }, ROOT)?.block);
@@ -97,6 +97,16 @@ const SAFE: [string, string][] = [
 	["git diff", "git diff HEAD"],
 	["git log", "git log --oneline -5"],
 	["git rev-parse", "git rev-parse --short HEAD"],
+	["git cwd status", "git -C /work/proj status"],
+	["git cwd log", "git -C /work/proj log --oneline -10"],
+	["git merge base", "git merge-base HEAD main"],
+	["git branch list all", "git branch -a"],
+	["git branch verbose", "git branch -vv"],
+	["git config read", "git config --get remote.origin.url"],
+	["quoted grep alternation", "grep -rn \"one\\|two\" src"],
+	["stderr to dev null", "find . -name '*.ts' 2>/dev/null"],
+	["fd redirection", "git show HEAD 2>&1 | head"],
+	["change directory", "cd /work/proj && git status"],
 	["piped reads", "ls | grep foo | wc -l"],
 	["compound reads", "git status && git diff"],
 	["node --version", "node --version"],
@@ -108,7 +118,10 @@ const BLOCKED: [string, string][] = [
 	["git add", "git add -A"],
 	["git push", "git push origin main"],
 	["git checkout", "git checkout main"],
+	["git cwd checkout", "git -C /work/proj checkout main"],
+	["git config write", "git config user.name attacker"],
 	["redirect", "echo hi > out.txt"],
+	["redirect under tmp", "ls > /tmp/out.txt"],
 	["append redirect", "echo hi >> log.txt"],
 	["rm", "rm -rf build"],
 	["mv", "mv a b"],
@@ -136,6 +149,8 @@ const BLOCKED: [string, string][] = [
 	["npm list disallowed", "npm list"],
 	["sed disallowed", "sed -n '1,10p' file.txt"],
 	["substitution write", "echo $(date) > stamp.txt"],
+	["double-quoted substitution", "echo \"$(touch marker)\""],
+	["process substitution", "cat <(python -c 'open(\"x\",\"w\")')"],
 ];
 
 test("bash policy: safe read-only commands are allowed", () => {

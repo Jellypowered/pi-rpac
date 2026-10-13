@@ -25,6 +25,8 @@ export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ["done", "blocked"]
 /** A verification check attached to a finished (or failed) task. result: pass | fail | unavailable */
 export interface VerificationCheck {
 	name: string;
+	/** acceptance checks determine task success; observations record audited subject outcomes without blocking the task */
+	kind?: "acceptance" | "observation";
 	result: "pass" | "fail" | "unavailable";
 	detail?: string;
 }
@@ -39,6 +41,8 @@ export interface RpacTask {
 	doneAt?: string;
 	verification?: VerificationCheck[];
 	issues?: string[];
+	/** hashed files produced by this task, including report-only outputs under .pi/rpac */
+	deliverables?: RpacArtifact[];
 	/** user-documented exception that accepted a failed task as done */
 	acceptedException?: string;
 }
@@ -147,6 +151,7 @@ export class RpacStateError extends Error {
 const PHASE_SET = new Set<string>(RPAC_PHASES);
 const STATUS_SET = new Set<string>(TASK_STATUSES);
 const RESULT_SET = new Set<string>(["pass", "fail", "unavailable"]);
+const CHECK_KIND_SET = new Set<string>(["acceptance", "observation"]);
 
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -317,12 +322,26 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 					if (isRecord(c) && isString(c.name) && isString(c.result) && RESULT_SET.has(c.result)) {
 						checks.push({
 							name: c.name,
+							...(isString(c.kind) && CHECK_KIND_SET.has(c.kind) ? { kind: c.kind as VerificationCheck["kind"] } : {}),
 							result: c.result as VerificationCheck["result"],
 							...(isString(c.detail) ? { detail: c.detail } : {}),
 						});
 					}
 				}
 				if (checks.length > 0) task.verification = checks;
+			}
+			if (Array.isArray(t.deliverables)) {
+				const deliverables: RpacArtifact[] = [];
+				for (const artifact of t.deliverables) {
+					if (isRecord(artifact) && isString(artifact.path) && isSha(artifact.sha256)) {
+						deliverables.push({
+							path: artifact.path,
+							sha256: artifact.sha256,
+							...(isString(artifact.updatedAt) ? { updatedAt: artifact.updatedAt } : {}),
+						});
+					}
+				}
+				if (deliverables.length > 0) task.deliverables = deliverables;
 			}
 			if (isStringArray(t.issues)) task.issues = t.issues;
 			if (isString(t.acceptedException)) task.acceptedException = t.acceptedException;
@@ -357,12 +376,26 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 					if (isRecord(c) && isString(c.name) && isString(c.result) && RESULT_SET.has(c.result)) {
 						checks.push({
 							name: c.name,
+							...(isString(c.kind) && CHECK_KIND_SET.has(c.kind) ? { kind: c.kind as VerificationCheck["kind"] } : {}),
 							result: c.result as VerificationCheck["result"],
 							...(isString(c.detail) ? { detail: c.detail } : {}),
 						});
 					}
 				}
 				if (checks.length > 0) historical.verification = checks;
+			}
+			if (Array.isArray(t.deliverables)) {
+				const deliverables: RpacArtifact[] = [];
+				for (const artifact of t.deliverables) {
+					if (isRecord(artifact) && isString(artifact.path) && isSha(artifact.sha256)) {
+						deliverables.push({
+							path: artifact.path,
+							sha256: artifact.sha256,
+							...(isString(artifact.updatedAt) ? { updatedAt: artifact.updatedAt } : {}),
+						});
+					}
+				}
+				if (deliverables.length > 0) historical.deliverables = deliverables;
 			}
 			if (isStringArray(t.issues)) historical.issues = t.issues;
 			if (isString(t.acceptedException)) historical.acceptedException = t.acceptedException;

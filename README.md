@@ -279,8 +279,9 @@ status`, `/rpac help`) to see the current state and available actions.
 
 The model calls a single `rpac` tool to record phase milestones (it can **request** approval but
 never grant it). Actions: `status`, `refine_complete`, `plan_complete`, `task_start`,
-`task_done` (requires `verification`; a task is `done` only when **all** checks pass — failing
-checks make it `failed`), `task_fail`, `task_block`, `task_unblock`, `decision`, `deviation`,
+`task_done` (requires `verification`; a task is `done` only when all **acceptance** checks pass;
+`observation` checks record audit findings without deciding task success; optional `deliverables`
+are hashed and tracked), `task_fail`, `task_block`, `task_unblock`, `decision`, `deviation`,
 `checkpoint`, `consolidate_complete`, `back_to_plan`, `back_to_act` (creates a concrete `Repair:`
 task).
 
@@ -351,7 +352,7 @@ All workflow state is under the target repository's git root, one directory **pe
 ├── state.json        # index (versioned): active workflow id + summary of every saved workflow
 ├── <workflow-id>/    # one directory per workflow (w-xxxxxxxx)
 │   ├── workflow.json #   machine state (versioned): phase, approvals, tasks (status,
-│   │                 #   verification, issues, exceptions), superseded taskHistory,
+│   │                 #   verification, observations, hashed deliverables, issues, exceptions), superseded taskHistory,
 │   │                 #   artifact refs (sha256), git baseline, checkpoints, bounded event log
 │   ├── requirements.md
 │   ├── plan.md
@@ -506,12 +507,13 @@ concepts* (what-not-how refinement, verify-against-the-codebase, one-question-at
 self-contained fresh-session artifacts, one-task-per-run with mandatory verification, honest
 consolidation) are adapted here — see Attribution.
 
-**Task outcomes are honest.** A task is `done` only when every recorded verification check
-passed. Failing or unavailable checks make it `failed` (with the issues recorded); a run that
+**Task outcomes are honest.** A task is `done` only when every recorded acceptance check
+passed. Failing or unavailable acceptance checks make it `failed` (with the issues recorded);
+non-blocking `observation` checks preserve actual audit/review outcomes; a run that
 ends mid-task leaves it `interrupted`; prerequisites that cannot be met make it `blocked`.
 `failed` is a user decision point: fix and re-run, or record a documented exception
-(`/rpac accept <id> <reason>`). In sequential mode, anything that is not a verified pass stops
-the run.
+(`/rpac accept <id> <reason>`). In sequential mode, anything that is not a verified acceptance
+pass stops the run; non-blocking observations do not.
 
 **Limitations, by design:**
 - **No autonomous session spawning.** `/rpac handoff` starts a fresh session only when *you*

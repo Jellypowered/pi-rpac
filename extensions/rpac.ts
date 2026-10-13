@@ -20,8 +20,8 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { Type, type Static } from "typebox";
 
 import { type RpacState, RpacStateError, newState, isSubstantive } from "../lib/schema.ts";
@@ -194,12 +194,14 @@ function statusReport(root: string): string {
 					: "·";
 			const issue = t.issues?.length ? `  ⚠ ${t.issues.join("; ")}` : "";
 			lines.push(`  ${mark} ${t.id}. [${t.status}] ${t.title}${issue}`);
+			for (const artifact of t.deliverables ?? []) lines.push(`      deliverable → ${artifact.path} (${artifact.sha256.slice(0, 8)}…)`);
 		}
 	}
 	for (const key of ["requirements", "plan", "report", "handoff"] as const) {
 		const art = state.artifacts[key];
 		if (art) lines.push(`Artifact: ${key} → ${art.path} (${art.sha256.slice(0, 8)}…)`);
 	}
+	for (const note of stalenessNotes(root, state).filter((n) => !n.startsWith("git:"))) lines.push(`Stale: ${note}`);
 	if (state.baseline) {
 		const div = detectDivergence(root, state.baseline);
 		lines.push(`Git: ${state.baseline.branch || "(detached)"} @ ${state.baseline.head.slice(0, 8)} (baseline ${state.baseline.dirty.length} dirty) — ${div.summary}`);
@@ -220,6 +222,28 @@ function statusReport(root: string): string {
 	return lines.join("\n");
 }
 
+/** Validate and hash task-produced files before they become durable workflow evidence. */
+function captureDeliverables(root: string, paths: string[] | undefined) {
+	if (!paths?.length) return undefined;
+	const captured = [];
+	const seen = new Set<string>();
+	for (const value of paths) {
+		if (!value.trim()) throw new RpacGuardError("deliverable paths must not be empty");
+		const abs = resolve(isAbsolute(value) ? value : join(root, value));
+		const rel = relative(root, abs);
+		if (!rel || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) {
+			throw new RpacGuardError(`deliverable must be a file inside the project: ${value}`);
+		}
+		if (seen.has(rel)) continue;
+		seen.add(rel);
+		if (!existsSync(abs) || !statSync(abs).isFile()) throw new RpacGuardError(`deliverable does not exist or is not a file: ${value}`);
+		const sha256 = sha256File(abs);
+		if (!sha256) throw new RpacGuardError(`could not hash deliverable: ${value}`);
+		captured.push({ path: rel, sha256, updatedAt: nowIso() });
+	}
+	return captured;
+}
+
 /** Stale-artifact + git divergence notes for a workflow. */
 function stalenessNotes(root: string, state: RpacState): string[] {
 	const notes: string[] = [];
@@ -232,6 +256,20 @@ function stalenessNotes(root: string, state: RpacState): string[] {
 			notes.push(`${key} artifact is missing on disk (${art.path})`);
 		} else if (sha !== art.sha256) {
 			notes.push(`${key} artifact changed since it was recorded — re-read it before acting`);
+		}
+	}
+	for (const task of [...state.tasks, ...state.taskHistory]) {
+		for (const artifact of task.deliverables ?? []) {
+			const abs = resolve(root, artifact.path);
+			const rel = relative(root, abs);
+			const label = "supersededAt" in task ? `historical task ${task.id}` : `task ${task.id}`;
+			if (!rel || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) {
+				notes.push(`${label} has an invalid deliverable path (${artifact.path})`);
+				continue;
+			}
+			const sha = sha256File(abs);
+			if (!sha) notes.push(`${label} deliverable is missing on disk (${artifact.path})`);
+			else if (sha !== artifact.sha256) notes.push(`${label} deliverable changed since it was recorded (${artifact.path})`);
 		}
 	}
 	const div = detectDivergence(root, state.baseline);
@@ -289,6 +327,10 @@ function requireOwnedActLease(root: string, state: RpacState, action: string, ta
 	}
 	if (action === "task_start" && lease.taskId !== null && lease.taskId !== undefined) {
 		const previous = state.tasks.find((t) => t.id === lease.taskId);
+		const requestedId = typeof taskRef === "number" ? taskRef : Number(taskRef);
+		if (previous?.status === "in_progress" && Number.isInteger(requestedId) && requestedId === lease.taskId) {
+			return; // harmless duplicate from a model that did not realize /rpac act already started it
+		}
 		if (!state.approvals.sequential) {
 			throw new RpacGuardError("one-task mode stops after the current task — wait for the user to run /rpac act again");
 		}
@@ -344,6 +386,7 @@ const RpacAction = Type.Union([
 
 const CheckSchema = Type.Object({
 	name: Type.String(),
+	kind: Type.Optional(Type.Union([Type.Literal("acceptance"), Type.Literal("observation")])),
 	result: Type.Union([Type.Literal("pass"), Type.Literal("fail"), Type.Literal("unavailable")]),
 	detail: Type.Optional(Type.String()),
 });
@@ -365,6 +408,8 @@ const RpacToolSchema = Type.Object({
 	verification: Type.Optional(Type.Array(CheckSchema)),
 	/** task_done: deviations from the plan noticed while implementing */
 	deviations: Type.Optional(Type.Array(Type.String())),
+	/** task_done: project-relative or absolute files produced by the task; RPAC hashes and tracks them */
+	deliverables: Type.Optional(Type.Array(Type.String())),
 	/** task_fail/task_block/back_to_plan/back_to_act/decision/deviation/checkpoint/consolidate text */
 	text: Type.Optional(Type.String()),
 });
@@ -1038,6 +1083,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 				const checks = t.verification?.length ? ` [${t.verification.map((c) => `${c.name}:${c.result}`).join(", ")}]` : "";
 				const issues = t.issues?.length ? ` — issues: ${t.issues.join("; ")}` : "";
 				lines.push(`- [${t.status === "done" ? "x" : " "}] #${t.id} ${t.title} — ${t.status}${checks}${issues}`);
+				for (const artifact of t.deliverables ?? []) lines.push(`  - deliverable: ${artifact.path} (${artifact.sha256.slice(0, 8)}…)`);
 			}
 			lines.push(open.length > 0 ? `Remaining: ${open.map((t) => `#${t.id} (${t.status})`).join(", ")}` : "All tasks complete.");
 		}
@@ -1204,15 +1250,16 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			"RPAC workflow state machine (Refine → Plan → Act → Consolidate). Actions: " +
 			"status (read state), refine_complete (requirements artifact done — user must approve), " +
 			"plan_complete (plan + task list done — user must approve), " +
-			"task_start/task_done/task_fail/task_block/task_unblock (execute plan tasks; task_done REQUIRES verification " +
-			"checks and only passes when all checks pass; failing checks make the task failed, not done), " +
+			"task_start/task_done/task_fail/task_block/task_unblock (the task named by /rpac act is already started; use task_start only to advance sequential mode; task_done REQUIRES verification " +
+			"checks and only passes when all acceptance checks pass; observation checks can record audited failures without failing the task; pass deliverables to hash task-produced files), " +
 			"decision/deviation/checkpoint (record to the workflow log), consolidate_complete (report.md done), " +
 			"back_to_plan/back_to_act (verification found a problem; back_to_act creates a repair task). " +
 			"Use only inside an active RPAC workflow; state lives in .pi/rpac/<workflow-id>/workflow.json.",
 		promptGuidelines: [
 			"Only call `rpac` actions while an RPAC workflow is active (started via /rpac start).",
 			"Never approve anything yourself: approvals happen via user dialogs or /rpac approve.",
-			"task_done requires real verification — run the checks first and report each result honestly; a task with failing checks is failed, not done.",
+			"The task named in an ACT directive is already in_progress. Do not call task_start for it; in sequential mode, call task_start only after task_done succeeds.",
+			"task_done requires real verification — run checks and report actual outcomes. Acceptance failures fail the task; for audit/review work, use kind=observation for a subject failure and a separate passing acceptance check that the result was correctly captured. Include every task-produced file in deliverables so RPAC can hash and track it.",
 		],
 		exposure: "model-only",
 		executionMode: "sequential",
@@ -1266,6 +1313,15 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						break;
 					}
 					case "task_start": {
+						const before = loadActive(root, root).state;
+						const requestedId = params.task === "next" ? undefined : Number(params.task);
+						const current = before?.tasks.find((t) => t.status === "in_progress");
+						if (current && requestedId === current.id) {
+							return textResult(
+								`Task ${current.id}/${before!.tasks.length} is already in progress under this /rpac act execution lease. Continue it; do not call task_start again.`,
+								{ action: params.action, phase: before!.phase, taskId: current.id, alreadyStarted: true },
+							);
+						}
 						message = run((s) => taskStart(s, params.task === "next" ? undefined : (params.task as number | string))).message;
 						const active = loadActive(root, root).state;
 						const started = active?.tasks.find((t) => t.status === "in_progress");
@@ -1276,7 +1332,8 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						break;
 					}
 					case "task_done": {
-						message = run((s) => taskDone(s, params.task as number | string, params.verification ?? [], params.deviations)).message;
+						const deliverables = captureDeliverables(root, params.deliverables);
+						message = run((s) => taskDone(s, params.task as number | string, params.verification ?? [], params.deviations, deliverables)).message;
 						logLine = `- **${nowIso()}** ${message}`;
 						break;
 					}

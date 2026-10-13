@@ -24,8 +24,10 @@ only the plan artifact and read-only inspection work.
    failure mode.
 3. **Work out the approach.** Design the *how*: what to reuse vs introduce, where each change
    goes, and an order that avoids broken intermediate states. Track dependencies between tasks.
-   Where more than one reasonable approach exists and the code cannot settle it, ask the user —
-   one question at a time, with your recommendation.
+   For enabled/disabled, started/stopped, authenticated/unauthenticated, or connected/disconnected
+   behavior, cover transitions, reload/reconfiguration, cleanup, and re-entry—not only startup
+   defaults. Where more than one reasonable approach exists and the code cannot settle it, ask the
+   user — one question at a time, with your recommendation.
 4. **Write the plan** — only once no open question remains.
 
 ## Size
