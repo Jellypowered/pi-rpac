@@ -9,7 +9,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../" && pwd)"
-EXT="$ROOT/extensions/rpac.ts"
 
 # Resolve the pi binary (PATH first, then the global install).
 PI="$(command -v pi || true)"
@@ -21,7 +20,10 @@ fi
 if [[ -z "$PI" ]]; then echo "ERROR: could not find the pi binary" >&2; exit 1; fi
 
 WORK="$(mktemp -d /tmp/rpac-smoke.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
+PKG="$(mktemp -d /tmp/rpac-smoke-package.XXXXXX)"
+trap 'rm -rf "$WORK" "$PKG"' EXIT
+cp -R "$ROOT/extensions" "$ROOT/lib" "$ROOT/skills" "$PKG/"
+cp "$ROOT/package.json" "$PKG/package.json"
 cd "$WORK"
 git init -q
 git config user.email smoke@test
@@ -40,7 +42,7 @@ echo "==> working dir: $WORK"
 # 1) /rpac start — should create the index (.pi/rpac/state.json) and a
 #    per-workflow directory (.pi/rpac/<id>/workflow.json) in refine phase.
 echo "==> running: pi -e <rpac> /rpac start 'add a greeting function'"
-"$PI" -e "$EXT" "${MODEL_ARGS[@]}" --no-tools --print "/rpac start add a greeting function" \
+"$PI" -ne -e "$PKG" "${MODEL_ARGS[@]}" --no-tools --print "/rpac start add a greeting function" \
   >/dev/null 2>"$WORK/stderr.log" || true
 
 IDX="$WORK/.pi/rpac/state.json"
@@ -71,7 +73,29 @@ echo "    workflow=$WID phase=$PHASE task='$TASK' git_baseline=$BASELINE"
 if [[ "$PHASE" != "refine" ]]; then echo "FAIL: expected phase 'refine', got '$PHASE'" >&2; exit 1; fi
 if [[ "$TASK" != "add a greeting function" ]]; then echo "FAIL: task not recorded" >&2; exit 1; fi
 
-echo "PASS: RPAC extension loaded and /rpac start dispatched correctly in the installed Pi."
+# 2) End the ordinary workflow, then dispatch a review through the copied package.
+"$PI" -ne -e "$PKG" "${MODEL_ARGS[@]}" --no-tools --print "/rpac abort --yes smoke transition" >/dev/null 2>>"$WORK/stderr.log" || true
+printf 'hello changed\n' > app.txt
+HEAD_BEFORE="$(git rev-parse HEAD)"
+INDEX_BEFORE="$(git write-tree)"
+APP_BEFORE="$(sha256sum app.txt | awk '{print $1}')"
+"$PI" -ne -e "$PKG" "${MODEL_ARGS[@]}" --no-tools --print "/rpac review current" >/dev/null 2>>"$WORK/stderr.log" || true
+WID="$(python3 -c "import json;print(json.load(open('$IDX')).get('active') or '')")"
+WF="$WORK/.pi/rpac/$WID/workflow.json"
+KIND="$(python3 -c "import json;print(json.load(open('$WF')).get('workflowKind'))")"
+MODE="$(python3 -c "import json;print(json.load(open('$WF')).get('review',{}).get('mode'))")"
+MANIFEST="$WORK/.pi/rpac/$WID/review-manifest.json"
+if [[ "$KIND" != "review" || "$MODE" != "current" || ! -f "$MANIFEST" ]]; then
+  echo "FAIL: packaged /rpac review did not create a current review manifest" >&2; exit 1
+fi
+if [[ "$(git rev-parse HEAD)" != "$HEAD_BEFORE" || "$(git write-tree)" != "$INDEX_BEFORE" || "$(sha256sum app.txt | awk '{print $1}')" != "$APP_BEFORE" ]]; then
+  echo "FAIL: review mutated HEAD, index, or reviewed content" >&2; exit 1
+fi
+if [[ ! -f "$PKG/skills/rpac-review/SKILL.md" || ! -f "$PKG/skills/rpac-review/LICENSE" ]]; then
+  echo "FAIL: copied package is missing rpac-review skill/license" >&2; exit 1
+fi
+
+echo "PASS: packaged RPAC start/review dispatch, review assets, and read-only Git/content invariants verified."
 # Note: a 'turn_end could not resolve the persisted assistant entry ID' line in
 # stderr is a known Pi-core quirk for follow-up messages in --print mode (reproduces
 # with any extension that calls sendUserMessage), not an RPAC bug.

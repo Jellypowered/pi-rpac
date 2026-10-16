@@ -9,6 +9,7 @@ import {
 	newState,
 	isSubstantive,
 	validateTaskGraph,
+	newReviewState,
 } from "../../lib/schema.ts";
 
 const PROJECT = "/tmp/project";
@@ -32,21 +33,25 @@ function base(raw: Record<string, unknown> = {}): Record<string, unknown> {
 	};
 }
 
-test("validateState accepts the current version and normalizes it", () => {
+test("validateState accepts the current version and defaults legacy workflow kind", () => {
 	const s = validateState(base(), PROJECT);
 	assert.equal(s.id, "w-abc12345");
 	assert.equal(s.project, PROJECT);
 	assert.equal(s.phase, "refine");
+	assert.equal(s.workflowKind, "implementation");
 });
 
-test("validateState accepts version 1 (legacy, for migration) and bumps it", () => {
-	const s = validateState(base({ version: 1 }), PROJECT);
-	assert.equal(s.version, RPAC_STATE_VERSION);
+test("validateState accepts versions 1 and 2 for migration and bumps them", () => {
+	for (const version of [1, 2]) {
+		const s = validateState(base({ version }), PROJECT);
+		assert.equal(s.version, RPAC_STATE_VERSION);
+		assert.equal(s.workflowKind, "implementation");
+	}
 });
 
 test("validateState rejects unsupported future versions without touching data", () => {
 	assert.throws(
-		() => validateState(base({ version: 3 })),
+		() => validateState(base({ version: RPAC_STATE_VERSION + 1 })),
 		(e: Error) => e instanceof RpacStateError && e.code === "unsupported_version" && /newer/.test(e.message),
 	);
 });
@@ -63,6 +68,9 @@ test("validateState rejects corrupt shapes", () => {
 	assert.throws(() => validateState("nope" as never), (e: Error) => e instanceof RpacStateError && e.code === "corrupt");
 	assert.throws(() => validateState(base({ phase: "bogus" })), (e: Error) => e instanceof RpacStateError && /invalid phase/.test(e.message));
 	assert.throws(() => validateState(base({ id: "" })), (e: Error) => e instanceof RpacStateError && /missing workflow id/.test(e.message));
+	assert.throws(() => validateState(base({ workflowKind: "unknown" })), /invalid workflow kind/);
+	assert.throws(() => validateState(base({ workflowKind: "review" })), /missing a valid review mode\/state/);
+	assert.throws(() => validateState(base({ review: {} })), /must not contain review state/);
 });
 
 test("task statuses include the explicit outcomes", () => {
@@ -153,16 +161,38 @@ test("validateIndex parses and normalizes an index", () => {
 	});
 	assert.equal(idx.active, "w-1");
 	assert.deepEqual(Object.keys(idx.workflows), ["w-1"]);
+	assert.equal(idx.workflows["w-1"]!.workflowKind, "implementation");
 });
 
-test("validateIndex rejects a wrong version", () => {
+test("validateIndex migrates v2 and rejects an unknown version", () => {
+	assert.equal(validateIndex({ version: 2, active: null, workflows: {} }).version, RPAC_STATE_VERSION);
 	assert.throws(() => validateIndex({ version: 9, active: null, workflows: {} }), (e: Error) => e instanceof RpacStateError);
 });
 
-test("newState creates a fresh v2 workflow bound to the project", () => {
+test("newState creates a fresh current-version workflow bound to the project", () => {
 	const s = newState(PROJECT, "do a thing");
 	assert.equal(s.version, RPAC_STATE_VERSION);
 	assert.equal(s.project, PROJECT);
 	assert.equal(s.phase, "refine");
+	assert.equal(s.workflowKind, "implementation");
 	assert.match(s.id, /^w-[0-9a-f]{8}$/);
+});
+
+test("newReviewState round-trips snapshot and coverage metadata", () => {
+	const state = newReviewState(PROJECT, {
+		mode: "staged",
+		fingerprint: "cd".repeat(32),
+		manifestSha256: "ab".repeat(32),
+		head: "unborn",
+		unborn: true,
+		capturedAt: "2026-01-01T00:00:00Z",
+		scopeItemIds: ["ri-a", "ri-b", "ri-a"],
+		exclusions: [{ path: "old-review.md", reason: "prior report" }],
+	});
+	const loaded = validateState(JSON.parse(JSON.stringify(state)), PROJECT);
+	assert.equal(loaded.workflowKind, "review");
+	assert.equal(loaded.review?.mode, "staged");
+	assert.deepEqual(loaded.review?.scopeItemIds, ["ri-a", "ri-b"]);
+	assert.equal(loaded.artifacts.reviewManifest?.sha256, "ab".repeat(32));
+	assert.match(loaded.artifacts.reviewManifest?.path ?? "", new RegExp(`\\.pi/rpac/${state.id}/review-manifest\\.json$`));
 });

@@ -1,10 +1,9 @@
 // RPAC workflow state — schema, types, validation. Pure (node builtins only).
 //
-// Version 2: per-workflow storage (see paths.ts), explicit task outcomes
-// (pending/in_progress/done/blocked/failed/interrupted), documented-exception
-// acceptance for failed tasks.
+// Version 3: workflow kinds and durable review snapshot/coverage metadata.
+// Version 2 introduced per-workflow storage and explicit task outcomes.
 
-export const RPAC_STATE_VERSION = 2;
+export const RPAC_STATE_VERSION = 3;
 
 export const RPAC_PHASES = ["refine", "plan", "act", "consolidate", "done", "aborted"] as const;
 export type RpacPhase = (typeof RPAC_PHASES)[number];
@@ -18,6 +17,35 @@ export const TASK_STATUSES = [
 	"interrupted",
 ] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export const WORKFLOW_KINDS = ["implementation", "review"] as const;
+export type WorkflowKind = (typeof WORKFLOW_KINDS)[number];
+
+export const REVIEW_MODES = ["current", "staged", "full"] as const;
+export type ReviewMode = (typeof REVIEW_MODES)[number];
+
+export interface RpacReviewState {
+	mode: ReviewMode;
+	/** fingerprint and artifact for the approved review scope */
+	fingerprint: string;
+	manifest: RpacArtifact;
+	head: string;
+	unborn: boolean;
+	capturedAt: string;
+	/** stable ids from the manifest; plan tasks assign these exactly once */
+	scopeItemIds: string[];
+	coveredItemIds: string[];
+	uncoveredItemIds: string[];
+	approvedChecks: string[];
+	exclusions: { path: string; reason: string }[];
+	drift?: {
+		detectedAt: string;
+		fingerprint: string;
+		addedItemIds: string[];
+		removedItemIds: string[];
+		changedItemIds: string[];
+	};
+}
 
 /** Terminal task outcomes that stop sequential execution and block task_start. */
 export const TERMINAL_TASK_STATUSES: readonly TaskStatus[] = ["done", "blocked"];
@@ -37,6 +65,8 @@ export interface RpacTask {
 	status: TaskStatus;
 	/** ids of tasks that must be done before this one (from the plan) */
 	dependsOn?: number[];
+	/** review manifest items assigned to this task (review workflows only) */
+	reviewItemIds?: string[];
 	/** filled when done */
 	doneAt?: string;
 	verification?: VerificationCheck[];
@@ -81,6 +111,8 @@ export interface RpacEvent {
 
 export interface RpacState {
 	version: number;
+	/** omitted in legacy v2 files; validation defaults it to implementation */
+	workflowKind: WorkflowKind;
 	/** workflow id, e.g. "w-1a2b3c4d" — also the directory name under .pi/rpac/ */
 	id: string;
 	/** absolute project root the workflow is bound to */
@@ -102,7 +134,10 @@ export interface RpacState {
 		plan?: RpacArtifact;
 		report?: RpacArtifact;
 		handoff?: RpacArtifact;
+		reviewManifest?: RpacArtifact;
 	};
+	/** present exactly when workflowKind is review */
+	review?: RpacReviewState;
 	baseline?: RpacBaseline;
 	checkpoints: RpacCheckpoint[];
 	/** bounded (last 50) append-only event trail */
@@ -116,6 +151,7 @@ export interface WorkflowSummary {
 	id: string;
 	task: string;
 	phase: RpacPhase;
+	workflowKind: WorkflowKind;
 	updatedAt: string;
 }
 
@@ -152,6 +188,8 @@ const PHASE_SET = new Set<string>(RPAC_PHASES);
 const STATUS_SET = new Set<string>(TASK_STATUSES);
 const RESULT_SET = new Set<string>(["pass", "fail", "unavailable"]);
 const CHECK_KIND_SET = new Set<string>(["acceptance", "observation"]);
+const WORKFLOW_KIND_SET = new Set<string>(WORKFLOW_KINDS);
+const REVIEW_MODE_SET = new Set<string>(REVIEW_MODES);
 
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -247,8 +285,10 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 			`workflow state version ${raw.version} is newer than the supported version ${RPAC_STATE_VERSION} — refusing to touch it`,
 		);
 	}
-	// version 1 (legacy shared layout) is accepted for migration only.
-	if (raw.version !== 1 && raw.version !== RPAC_STATE_VERSION) {
+	// Versions 1 (shared layout) and 2 (pre-review per-workflow layout) are
+	// accepted and normalized; older binaries reject v3 rather than dropping
+	// review metadata on save.
+	if (raw.version !== 1 && raw.version !== 2 && raw.version !== RPAC_STATE_VERSION) {
 		throw new RpacStateError(
 			"unsupported_version",
 			`unsupported workflow state version ${String(raw.version ?? "?")} (expected ${RPAC_STATE_VERSION})`,
@@ -272,8 +312,13 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 		throw new RpacStateError("corrupt", "missing createdAt/updatedAt");
 	}
 
+	if (raw.workflowKind !== undefined && (!isString(raw.workflowKind) || !WORKFLOW_KIND_SET.has(raw.workflowKind))) {
+		throw new RpacStateError("corrupt", `invalid workflow kind: ${String(raw.workflowKind)}`);
+	}
+	const workflowKind: WorkflowKind = isString(raw.workflowKind) ? raw.workflowKind as WorkflowKind : "implementation";
 	const state: RpacState = {
 		version: RPAC_STATE_VERSION,
+		workflowKind,
 		id: raw.id,
 		project: raw.project,
 		task: raw.task,
@@ -315,6 +360,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 				const deps = (t.dependsOn as unknown[]).filter((d): d is number => typeof d === "number" && Number.isInteger(d));
 				if (deps.length > 0) task.dependsOn = deps;
 			}
+			if (isStringArray(t.reviewItemIds)) task.reviewItemIds = [...new Set(t.reviewItemIds as string[])];
 			if (isString(t.doneAt)) task.doneAt = t.doneAt;
 			if (Array.isArray(t.verification)) {
 				const checks: VerificationCheck[] = [];
@@ -369,6 +415,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 				const deps = (t.dependsOn as unknown[]).filter((d): d is number => typeof d === "number" && Number.isInteger(d));
 				if (deps.length > 0) historical.dependsOn = deps;
 			}
+			if (isStringArray(t.reviewItemIds)) historical.reviewItemIds = [...new Set(t.reviewItemIds as string[])];
 			if (isString(t.doneAt)) historical.doneAt = t.doneAt;
 			if (Array.isArray(t.verification)) {
 				const checks: VerificationCheck[] = [];
@@ -404,7 +451,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 	}
 
 	if (isRecord(raw.artifacts)) {
-		for (const key of ["requirements", "plan", "report", "handoff"] as const) {
+		for (const key of ["requirements", "plan", "report", "handoff", "reviewManifest"] as const) {
 			const art = raw.artifacts[key];
 			if (isRecord(art) && isString(art.path) && isSha(art.sha256)) {
 				state.artifacts[key] = {
@@ -414,6 +461,65 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 				};
 			}
 		}
+	}
+
+	if (workflowKind === "review") {
+		const review = raw.review;
+		if (!isRecord(review) || !isString(review.mode) || !REVIEW_MODE_SET.has(review.mode)) {
+			throw new RpacStateError("corrupt", "review workflow is missing a valid review mode/state");
+		}
+		if (!isString(review.fingerprint) || !isSha(review.fingerprint) || !isRecord(review.manifest) ||
+			!isString(review.manifest.path) || !isSha(review.manifest.sha256) || !isString(review.head) ||
+			!isString(review.capturedAt) || !isStringArray(review.scopeItemIds) || !isStringArray(review.coveredItemIds) ||
+			!isStringArray(review.uncoveredItemIds) || !isStringArray(review.approvedChecks) || !Array.isArray(review.exclusions)) {
+			throw new RpacStateError("corrupt", "review workflow has malformed snapshot or coverage state");
+		}
+		const exclusions: { path: string; reason: string }[] = [];
+		for (const exclusion of review.exclusions) {
+			if (!isRecord(exclusion) || !isString(exclusion.path) || !isString(exclusion.reason)) {
+				throw new RpacStateError("corrupt", "review workflow has malformed exclusions");
+			}
+			exclusions.push({ path: exclusion.path, reason: exclusion.reason });
+		}
+		const manifest: RpacArtifact = {
+			path: review.manifest.path,
+			sha256: review.manifest.sha256,
+			...(isString(review.manifest.updatedAt) ? { updatedAt: review.manifest.updatedAt } : {}),
+		};
+		if (state.artifacts.reviewManifest &&
+			(state.artifacts.reviewManifest.path !== manifest.path || state.artifacts.reviewManifest.sha256 !== manifest.sha256)) {
+			throw new RpacStateError("corrupt", "review manifest artifact does not match review snapshot state");
+		}
+		state.artifacts.reviewManifest = { ...manifest };
+		state.review = {
+			mode: review.mode as ReviewMode,
+			fingerprint: review.fingerprint,
+			manifest,
+			head: review.head,
+			unborn: Boolean(review.unborn),
+			capturedAt: review.capturedAt,
+			scopeItemIds: [...new Set(review.scopeItemIds as string[])],
+			coveredItemIds: [...new Set(review.coveredItemIds as string[])],
+			uncoveredItemIds: [...new Set(review.uncoveredItemIds as string[])],
+			approvedChecks: [...new Set(review.approvedChecks as string[])],
+			exclusions,
+		};
+		if (review.drift !== undefined) {
+			if (!isRecord(review.drift) || !isString(review.drift.detectedAt) || !isSha(review.drift.fingerprint) ||
+				!isStringArray(review.drift.addedItemIds) || !isStringArray(review.drift.removedItemIds) ||
+				!isStringArray(review.drift.changedItemIds)) {
+				throw new RpacStateError("corrupt", "review workflow has malformed drift state");
+			}
+			state.review.drift = {
+				detectedAt: review.drift.detectedAt,
+				fingerprint: review.drift.fingerprint,
+				addedItemIds: [...new Set(review.drift.addedItemIds as string[])],
+				removedItemIds: [...new Set(review.drift.removedItemIds as string[])],
+				changedItemIds: [...new Set(review.drift.changedItemIds as string[])],
+			};
+		}
+	} else if (raw.review !== undefined) {
+		throw new RpacStateError("corrupt", "implementation workflow must not contain review state");
 	}
 
 	if (isRecord(raw.baseline) && isString(raw.baseline.head) && isString(raw.baseline.createdAt)) {
@@ -451,7 +557,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 /** Validate a parsed state.json index. Throws RpacStateError on failure. */
 export function validateIndex(raw: unknown): RpacIndex {
 	if (!isRecord(raw)) throw new RpacStateError("corrupt", "state.json is not a JSON object");
-	if (raw.version !== RPAC_STATE_VERSION) {
+	if (raw.version !== 2 && raw.version !== RPAC_STATE_VERSION) {
 		throw new RpacStateError("corrupt", `unsupported state index version ${String(raw.version ?? "?")}`);
 	}
 	const workflows: Record<string, WorkflowSummary> = {};
@@ -463,6 +569,9 @@ export function validateIndex(raw: unknown): RpacIndex {
 					id: entry.id,
 					task: entry.task,
 					phase: entry.phase as RpacPhase,
+					workflowKind: isString(entry.workflowKind) && WORKFLOW_KIND_SET.has(entry.workflowKind)
+						? entry.workflowKind as WorkflowKind
+						: "implementation",
 					updatedAt: entry.updatedAt,
 				};
 			}
@@ -479,6 +588,7 @@ export function validateIndex(raw: unknown): RpacIndex {
 export function newState(project: string, task: string, now = nowIsoDefault()): RpacState {
 	return {
 		version: RPAC_STATE_VERSION,
+		workflowKind: "implementation",
 		id: `w-${shortIdDefault()}`,
 		project,
 		task,
@@ -493,6 +603,48 @@ export function newState(project: string, task: string, now = nowIsoDefault()): 
 		createdAt: now,
 		updatedAt: now,
 	};
+}
+
+export interface NewReviewStateInput {
+	mode: ReviewMode;
+	fingerprint: string;
+	manifestSha256: string;
+	head: string;
+	unborn: boolean;
+	capturedAt: string;
+	scopeItemIds: string[];
+	exclusions?: { path: string; reason: string }[];
+}
+
+/** Create a review workflow around a manifest already captured on disk. */
+export function newReviewState(
+	project: string,
+	input: NewReviewStateInput,
+	now = nowIsoDefault(),
+): RpacState {
+	if (!isSha(input.manifestSha256)) throw new Error("review manifest SHA-256 is invalid");
+	const state = newState(project, `Self-review ${input.mode} snapshot`, now);
+	state.workflowKind = "review";
+	const manifest = {
+		path: `.pi/rpac/${state.id}/review-manifest.json`,
+		sha256: input.manifestSha256,
+		updatedAt: now,
+	};
+	state.artifacts.reviewManifest = { ...manifest };
+	state.review = {
+		mode: input.mode,
+		fingerprint: input.fingerprint,
+		manifest: { ...manifest },
+		head: input.head,
+		unborn: input.unborn,
+		capturedAt: input.capturedAt,
+		scopeItemIds: [...new Set(input.scopeItemIds)],
+		coveredItemIds: [],
+		uncoveredItemIds: [],
+		approvedChecks: [],
+		exclusions: input.exclusions?.map((entry) => ({ ...entry })) ?? [],
+	};
+	return state;
 }
 
 /** Cap the bounded arrays in place so the on-disk file stays small. */

@@ -1,6 +1,6 @@
 /**
  * Harness for e2e tests against the real Pi binary (RPC mode), adapted from
- * the MTP2 harness for the v2 per-workflow layout:
+ * the MTP2 harness for the versioned per-workflow layout:
  *
  * - RpcClient: JSONL RPC client (prompt/command responses, extension_ui
  *   requests, session events). Auto-answers confirm dialogs when enabled.
@@ -187,7 +187,7 @@ export interface WorkflowMockContent {
  * do from the transcript: the last `[RPAC] phase=X` marker (injected by the
  * extension's before_agent_start context) plus the number of tool results
  * after it. Artifact paths come from `resolveArtifact`, which the test
- * implements by reading .pi/rpac/state.json (v2 per-workflow layout).
+ * implements by reading .pi/rpac/state.json (versioned per-workflow layout).
  */
 export function startWorkflowMockModel(
 	content: WorkflowMockContent,

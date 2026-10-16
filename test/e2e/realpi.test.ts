@@ -13,7 +13,7 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
@@ -27,7 +27,8 @@ import {
 	type WorkflowMockContent,
 } from "./realpi-harness.ts";
 
-const EXTENSION_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "extensions", "rpac.ts");
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const EXTENSION_PATH = join(PACKAGE_ROOT, "extensions", "rpac.ts");
 
 const REQUIREMENTS = [
 	"# Requirements",
@@ -82,6 +83,7 @@ const skip = !piAvailable() || !existsSync(EXTENSION_PATH);
 describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip: skip ? "pi binary or extension not available" : false }, () => {
 	let repo: string;
 	let agentDir: string;
+	let packageDir: string;
 	let client: RpcClient;
 	let mock: { server: Server; port: number };
 
@@ -92,8 +94,11 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 		});
 		repo = makeSampleRepo();
 		agentDir = mkdtempSync(join(tmpdir(), "rpac-e2e-agent-"));
+		packageDir = mkdtempSync(join(tmpdir(), "rpac-e2e-package-"));
+		for (const entry of ["extensions", "lib", "skills"]) cpSync(join(PACKAGE_ROOT, entry), join(packageDir, entry), { recursive: true });
+		cpSync(join(PACKAGE_ROOT, "package.json"), join(packageDir, "package.json"));
 		writeFileSync(join(agentDir, "models.json"), mockModelsJson(mock.port));
-		client = new RpcClient(repo, ["--mode", "rpc", "--no-session", "--extension", EXTENSION_PATH], {
+		client = new RpcClient(repo, ["--mode", "rpc", "--no-session", "-e", packageDir], {
 			...process.env,
 			PI_CODING_AGENT_DIR: agentDir,
 		});
@@ -105,6 +110,7 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 		mock?.server.close();
 		if (repo) rmSync(repo, { recursive: true, force: true });
 		if (agentDir) rmSync(agentDir, { recursive: true, force: true });
+		if (packageDir) rmSync(packageDir, { recursive: true, force: true });
 	});
 
 	const wfFile = () => join(repo, ".pi", "rpac", wfId(), "workflow.json");
@@ -120,6 +126,19 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 			const r = await cmd("/rpac status");
 			assert.equal(r.success, true);
 			assert.ok(client.uiNotifyMatching(/No active workflow/i), `no-workflow notice (stderr: ${client.stderrLog.slice(-300)})`);
+		},
+	);
+
+	it(
+		"loads the packaged rpac-review skill and preserved license outside the source checkout",
+		{ timeout: 60_000 },
+		async () => {
+			assert.notEqual(packageDir, PACKAGE_ROOT);
+			assert.ok(existsSync(join(packageDir, "skills", "rpac-review", "SKILL.md")));
+			assert.match(readFileSync(join(packageDir, "skills", "rpac-review", "LICENSE"), "utf8"), /Engineering in the age of AI/);
+			const r = await cmd("/skill:rpac-review");
+			assert.equal(r.success, true, `packaged skill command dispatches (stderr: ${client.stderrLog.slice(-300)})`);
+			await settle();
 		},
 	);
 
@@ -225,6 +244,26 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 			assert.equal(count, "1");
 			const status = execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" });
 			assert.ok(status.length > 0, "working tree still dirty (code change uncommitted)");
+		},
+	);
+
+	it(
+		"packaged /rpac review dispatches without changing HEAD, index, or reviewed files",
+		{ timeout: 120_000 },
+		async () => {
+			const headBefore = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" });
+			const indexBefore = execFileSync("git", ["write-tree"], { cwd: repo, encoding: "utf8" });
+			const appBefore = readFileSync(join(repo, "src", "app.js"), "utf8");
+			const r = await cmd("/rpac review staged");
+			assert.equal(r.success, true);
+			const s = wf();
+			assert.equal(s.workflowKind, "review");
+			assert.equal(s.review.mode, "staged");
+			assert.ok(existsSync(join(repo, ".pi", "rpac", s.id, "review-manifest.json")));
+			assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }), headBefore);
+			assert.equal(execFileSync("git", ["write-tree"], { cwd: repo, encoding: "utf8" }), indexBefore);
+			assert.equal(readFileSync(join(repo, "src", "app.js"), "utf8"), appBefore);
+			await settle();
 		},
 	);
 });

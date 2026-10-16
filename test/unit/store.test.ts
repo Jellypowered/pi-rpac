@@ -14,7 +14,7 @@ import {
 	updateActive,
 	artifactPresent,
 } from "../../lib/store.ts";
-import { RpacStateError, newState } from "../../lib/schema.ts";
+import { RpacStateError, newState, newReviewState } from "../../lib/schema.ts";
 import { workflowDir, workflowFile, indexPath, rpacDir, quarantineDir } from "../../lib/paths.ts";
 import { nowIso, projectRoot, makeTempDir, removeTree } from "../../lib/util.ts";
 
@@ -51,6 +51,23 @@ test("createWorkflow + loadActive round-trips and binds to the project root", ()
 	// per-workflow log was created with a header
 	const log = readFileSync(join(workflowDir(repo, id), "log.md"), "utf8");
 	assert.match(log, /workflow started: first task/);
+});
+
+test("review workflow metadata and kind survive store/index round-trips", () => {
+	const state = newReviewState(repo, {
+		mode: "current",
+		fingerprint: "cd".repeat(32),
+		manifestSha256: "ab".repeat(32),
+		head: "1".repeat(40),
+		unborn: false,
+		capturedAt: "2026-01-01T00:00:00Z",
+		scopeItemIds: ["ri-a"],
+	});
+	createWorkflow(repo, state, true);
+	const loaded = loadActive(repo, repo);
+	assert.equal(loaded.state?.workflowKind, "review");
+	assert.equal(loaded.state?.review?.fingerprint, "cd".repeat(32));
+	assert.equal(loaded.index.workflows[state.id]?.workflowKind, "review");
 });
 
 test("createWorkflow refuses to replace a non-terminal active workflow without force", () => {
@@ -195,7 +212,7 @@ test("peekActive reads without the lock and is null on pending legacy migration"
 	const { id } = freshWorkflow("peekable");
 	const s = peekActive(repo, repo);
 	assert.ok(s && s.id === id);
-	// legacy layout present → v2 peek is null (migration happens on the next locked op)
+	// legacy shared layout present → peek is null (migration happens on the next locked op)
 	const legacy = makeTempDir("rpac-legacy-peek-");
 	try {
 		mkdirSync(join(legacy, ".pi", "rpac"), { recursive: true });
@@ -233,7 +250,7 @@ test("migration: v1 shared layout becomes a per-workflow directory (nothing lost
 		const { index, state, notes } = loadActive(legacy, legacy);
 		assert.ok(state, "active workflow present");
 		assert.equal(state!.task, "legacy active task");
-		assert.equal(state!.version, 2, "bumped to v2");
+		assert.equal(state!.version, 3, "bumped to current version");
 		const wfDir = workflowDir(legacy, state!.id);
 		assert.ok(existsSync(join(wfDir, "workflow.json")));
 		assert.equal(readFileSync(join(wfDir, "requirements.md"), "utf8"), "# legacy requirements body\nline\nline\n", "requirements moved into the workflow dir");
@@ -245,7 +262,7 @@ test("migration: v1 shared layout becomes a per-workflow directory (nothing lost
 		assert.ok(index.workflows["w-archived1"], "archived workflow in the index");
 		assert.ok(existsSync(join(workflowDir(legacy, "w-archived1"), "workflow.json")));
 		const archState = JSON.parse(readFileSync(join(workflowDir(legacy, "w-archived1"), "workflow.json"), "utf8"));
-		assert.equal(archState.version, 2);
+		assert.equal(archState.version, 3);
 		assert.deepEqual(archState.artifacts, {}); // shared files cannot be attributed — honestly cleared
 		assert.ok(archState.events.some((e: { detail: string }) => /migrated/.test(e.detail)));
 		assert.ok(notes.some((n) => /migrated/.test(n)));

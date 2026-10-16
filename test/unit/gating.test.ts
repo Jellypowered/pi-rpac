@@ -1,7 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isReadOnlyCommand, gateToolCall, gateUnreadableState, allowedArtifactForPhase, pathIsExactly, resolveTarget } from "../../lib/gating.ts";
-import { newState, type RpacState } from "../../lib/schema.ts";
+import {
+	isApprovedReviewCheck,
+	isReadOnlyCommand,
+	gateToolCall,
+	gateUnreadableState,
+	allowedArtifactForPhase,
+	pathIsExactly,
+	resolveTarget,
+} from "../../lib/gating.ts";
+import { newReviewState, newState, type RpacState } from "../../lib/schema.ts";
+import { reviewBatchFile, reviewReportFile } from "../../lib/paths.ts";
 import { join } from "node:path";
 
 const ROOT = "/work/proj";
@@ -14,6 +23,24 @@ function state(phase: "refine" | "plan" | "act" | "consolidate"): RpacState {
 	const s = newState(ROOT, "demo");
 	s.id = WF;
 	s.phase = phase;
+	return s;
+}
+
+function reviewState(phase: "refine" | "plan" | "act" | "consolidate"): RpacState {
+	const s = newReviewState(ROOT, {
+		mode: "current",
+		fingerprint: "ab".repeat(32),
+		manifestSha256: "cd".repeat(32),
+		head: "1".repeat(40),
+		unborn: false,
+		capturedAt: "2026-01-01T00:00:00Z",
+		scopeItemIds: ["ri-a"],
+	});
+	s.id = WF;
+	s.phase = phase;
+	s.tasks = [{ id: 1, title: "review batch", status: "in_progress", reviewItemIds: ["ri-a"] }];
+	s.review!.approvedChecks = ["npm test", "rm -rf src"];
+	s.approvals.plan = true;
 	return s;
 }
 
@@ -59,7 +86,36 @@ test("PLAN: writing the plan artifact is allowed, requirements is not", () => {
 	assert.ok(gateToolCall(s, ROOT, "edit", { path: REQ, edits: [] }, ROOT)?.block);
 });
 
-test("ACT/CONSOLIDATE: no gating at all (normal Pi permissions apply)", () => {
+test("review workflows allow only their exact phase artifact in every phase", () => {
+	const cases = [
+		["refine", REQ],
+		["plan", PLAN],
+		["act", reviewBatchFile(ROOT, WF, 1)],
+		["consolidate", reviewReportFile(ROOT, WF)],
+	] as const;
+	for (const [phase, allowed] of cases) {
+		const s = reviewState(phase);
+		assert.equal(gateToolCall(s, ROOT, "write", { path: allowed, content: "evidence" }, ROOT), null, `${phase} artifact allowed`);
+		assert.ok(gateToolCall(s, ROOT, "write", { path: APP, content: "x" }, ROOT)?.block, `${phase} source blocked`);
+		assert.ok(gateToolCall(s, ROOT, "write", { path: join(ROOT, "..", "sibling", "x"), content: "x" }, ROOT)?.block, `${phase} sibling blocked`);
+	}
+	const act = reviewState("act");
+	assert.ok(gateToolCall(act, ROOT, "write", { path: reviewBatchFile(ROOT, WF, 2), content: "wrong" }, ROOT)?.block);
+});
+
+test("review shell allows reads and exact approved non-destructive checks only", () => {
+	const act = reviewState("act");
+	assert.equal(gateToolCall(act, ROOT, "bash", { command: "git status" }, ROOT), null);
+	assert.equal(isApprovedReviewCheck(act, "npm test"), true);
+	assert.equal(gateToolCall(act, ROOT, "bash", { command: "npm test" }, ROOT), null);
+	assert.ok(gateToolCall(act, ROOT, "bash", { command: "npm run other" }, ROOT)?.block);
+	assert.equal(isApprovedReviewCheck(act, "rm -rf src"), false, "denylist wins over plan approval");
+	assert.ok(gateToolCall(act, ROOT, "bash", { command: "rm -rf src" }, ROOT)?.block);
+	assert.ok(gateToolCall(reviewState("plan"), ROOT, "bash", { command: "npm test" }, ROOT)?.block, "checks wait for ACT");
+	assert.ok(gateToolCall(act, ROOT, "custom_mutator", {}, ROOT)?.block);
+});
+
+test("ACT/CONSOLIDATE: no gating at all (normal implementation workflow permissions apply)", () => {
 	for (const phase of ["act", "consolidate"] as const) {
 		const s = state(phase);
 		assert.equal(gateToolCall(s, ROOT, "write", { path: APP, content: "x" }, ROOT), null);

@@ -14,7 +14,7 @@
 // (itself inherited from Pi's plan-mode example extension).
 import { isAbsolute, resolve, join } from "node:path";
 import type { RpacState } from "./schema.ts";
-import { artifactFile } from "./paths.ts";
+import { artifactFile, reviewBatchFile, reviewReportFile } from "./paths.ts";
 
 const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\brm\b/,
@@ -198,20 +198,37 @@ function normalize(command: string): string {
  * match the safe allowlist and none may match a destructive pattern
  * (fail-closed: unknown commands are blocked).
  */
-export function isReadOnlyCommand(rawCommand: string): boolean {
-	const command = rawCommand.trim();
-	if (command === "") return true;
-	const segments = shellSegments(command);
-	if (!segments?.length) return false;
+function hasDestructiveShellSegment(rawCommand: string): boolean {
+	const segments = shellSegments(rawCommand.trim());
+	if (!segments?.length) return true;
 	for (const seg of segments) {
 		const withoutSafeRedirections = stripSafeRedirections(seg);
 		const normalized = normalize(withoutSafeRedirections);
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
-			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) return false;
+			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) return true;
 		}
+	}
+	return false;
+}
+
+export function isReadOnlyCommand(rawCommand: string): boolean {
+	const command = rawCommand.trim();
+	if (command === "") return true;
+	const segments = shellSegments(command);
+	if (!segments?.length || hasDestructiveShellSegment(command)) return false;
+	for (const seg of segments) {
+		const withoutSafeRedirections = stripSafeRedirections(seg);
+		const normalized = normalize(withoutSafeRedirections);
 		if (!SAFE_PATTERNS.some((p) => p.test(normalized))) return false;
 	}
 	return true;
+}
+
+/** Exact user-approved review checks may exceed the inspection allowlist, but never the destructive denylist. */
+export function isApprovedReviewCheck(state: RpacState, rawCommand: string): boolean {
+	if (state.workflowKind !== "review" || !state.review || !state.approvals.plan) return false;
+	const command = rawCommand.trim();
+	return state.review.approvedChecks.includes(command) && !hasDestructiveShellSegment(command);
 }
 
 /** The single workflow artifact the model may write in the given phase. */
@@ -256,6 +273,7 @@ export function gateToolCall(
 	input: Record<string, unknown> | undefined,
 	root: string,
 ): GateDecision | null {
+	if (state.workflowKind === "review") return gateReviewToolCall(state, cwd, toolName, input, root);
 	if (state.phase !== "refine" && state.phase !== "plan") return null;
 	const phase = state.phase.toUpperCase();
 	const allowed = allowedArtifactForPhase(root, state.id, state.phase);
@@ -293,6 +311,55 @@ export function gateToolCall(
 		reason:
 			`RPAC ${phase} phase is fail-closed: custom tool "${toolName}" is not on the read-only allowlist. ` +
 			"Use read/grep/find/ls/codemode for investigation, or finish the phase before invoking mutating tools.",
+	};
+}
+
+function reviewWritableArtifact(state: RpacState, root: string): string | null {
+	if (state.phase === "refine") return artifactFile(root, state.id, "requirements");
+	if (state.phase === "plan") return artifactFile(root, state.id, "plan");
+	if (state.phase === "act") {
+		const task = state.tasks.find((entry) => entry.status === "in_progress");
+		return task ? reviewBatchFile(root, state.id, task.id) : null;
+	}
+	if (state.phase === "consolidate") return reviewReportFile(root, state.id);
+	return null;
+}
+
+/** Report-only gate applied throughout every active review phase. */
+function gateReviewToolCall(
+	state: RpacState,
+	cwd: string,
+	toolName: string,
+	input: Record<string, unknown> | undefined,
+	root: string,
+): GateDecision | null {
+	if (state.phase === "done" || state.phase === "aborted") return null;
+	const phase = `REVIEW ${state.phase.toUpperCase()}`;
+	const allowed = reviewWritableArtifact(state, root);
+	if (toolName === "write" || toolName === "edit") {
+		const target = typeof input?.path === "string" ? input.path : undefined;
+		if (!target) return null;
+		if (allowed && pathIsExactly(cwd, target, allowed)) return null;
+		return {
+			block: true,
+			reason: `RPAC ${phase} is report-only: reviewed files cannot be modified. The only writable artifact is ${allowed ?? "(none)"}.`,
+		};
+	}
+	if (toolName === "bash" || toolName === "powershell") {
+		const command = typeof input?.command === "string" ? input.command : undefined;
+		if (command === undefined || isReadOnlyCommand(command) ||
+			((state.phase === "act" || state.phase === "consolidate") && isApprovedReviewCheck(state, command))) return null;
+		return {
+			block: true,
+			reason:
+				`RPAC ${phase} permits read-only inspection and exact non-destructive checks from the approved review plan. ` +
+				`Blocked unapproved or mutating command: ${command.length > 160 ? command.slice(0, 157) + "…" : command}`,
+		};
+	}
+	if (toolName === "rpac" || READ_ONLY_TOOLS.has(toolName)) return null;
+	return {
+		block: true,
+		reason: `RPAC ${phase} is fail-closed: custom tool "${toolName}" is not a known read-only review tool.`,
 	};
 }
 

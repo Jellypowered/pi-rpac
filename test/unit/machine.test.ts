@@ -17,7 +17,10 @@ import {
 	pause,
 	planComplete,
 	readyTasks,
+	recordReviewDrift,
 	refineComplete,
+	replaceReviewScope,
+	reviewCoverage,
 	resume,
 	taskAccept,
 	taskBlock,
@@ -26,7 +29,7 @@ import {
 	taskStart,
 	taskUnblock,
 } from "../../lib/machine.ts";
-import { type RpacState, newState, capStateArrays } from "../../lib/schema.ts";
+import { type RpacState, newState, newReviewState, capStateArrays } from "../../lib/schema.ts";
 import { makeTempDir, removeTree } from "../../lib/util.ts";
 
 const PROJECT = "/work/demo";
@@ -81,6 +84,30 @@ function approvedPlanState(): RpacState {
 	planComplete(env.state, env.planFile, [
 		{ title: "Implement greet()" },
 		{ title: "Wire greet into the app", dependsOn: [1] },
+	]);
+	approvePlan(env.state);
+	env.state.phase = "act";
+	env.cleanup();
+	return env.state;
+}
+
+function approvedReviewState(): RpacState {
+	const env = mkState();
+	withArtifacts(env);
+	env.state = newReviewState(PROJECT, {
+		mode: "current",
+		fingerprint: "cd".repeat(32),
+		manifestSha256: "ab".repeat(32),
+		head: "1".repeat(40),
+		unborn: false,
+		capturedAt: "2026-01-01T00:00:00Z",
+		scopeItemIds: ["ri-a", "ri-b"],
+	});
+	refineComplete(env.state, env.reqFile);
+	approveRequirements(env.state);
+	planComplete(env.state, env.planFile, [
+		{ title: "Review batch", reviewItemIds: ["ri-a", "ri-b"] },
+		{ title: "Validate findings", dependsOn: [1] },
 	]);
 	approvePlan(env.state);
 	env.state.phase = "act";
@@ -167,6 +194,93 @@ test("plan_complete is gated on approved requirements and a valid task graph", (
 	} finally {
 		env.cleanup();
 	}
+});
+
+test("review plans require exact, single assignment of every manifest item", () => {
+	const env = mkState();
+	try {
+		withArtifacts(env);
+		env.state = newReviewState(PROJECT, {
+			mode: "full",
+			fingerprint: "cd".repeat(32),
+			manifestSha256: "ab".repeat(32),
+			head: "1".repeat(40),
+			unborn: false,
+			capturedAt: "2026-01-01T00:00:00Z",
+			scopeItemIds: ["ri-a", "ri-b"],
+		});
+		refineComplete(env.state, env.reqFile);
+		approveRequirements(env.state);
+		assert.throws(() => planComplete(env.state, env.planFile, [{ title: "partial", reviewItemIds: ["ri-a"] }]), /leaves 1 manifest item/);
+		assert.throws(
+			() => planComplete(env.state, env.planFile, [{ title: "bad", reviewItemIds: ["ri-a", "ri-missing", "ri-b"] }]),
+			/unknown manifest item ri-missing/,
+		);
+		assert.throws(
+			() => planComplete(env.state, env.planFile, [
+				{ title: "one", reviewItemIds: ["ri-a", "ri-b"] },
+				{ title: "two", reviewItemIds: ["ri-b"] },
+			]),
+			/assigned more than once/,
+		);
+		planComplete(env.state, env.planFile, [
+			{ title: "batch one", reviewItemIds: ["ri-a"] },
+			{ title: "batch two", reviewItemIds: ["ri-b"], dependsOn: [1] },
+			{ title: "validate", dependsOn: [2] },
+		], "plan.md", ["npm test", "npm test", "  "]);
+		assert.deepEqual(env.state.tasks[1]!.reviewItemIds, ["ri-b"]);
+		assert.deepEqual(env.state.review!.approvedChecks, ["npm test"]);
+	} finally {
+		env.cleanup();
+	}
+});
+
+test("review scope can be replaced only during refine/plan and invalidates an old plan", () => {
+	const state = approvedReviewState();
+	state.phase = "plan";
+	state.approvals.plan = true;
+	state.artifacts.plan = { path: "plan.md", sha256: "12".repeat(32) };
+	const result = replaceReviewScope(state, {
+		fingerprint: "ef".repeat(32),
+		manifest: { path: "new-manifest.json", sha256: "34".repeat(32) },
+		head: "2".repeat(40),
+		unborn: false,
+		capturedAt: "2026-01-02T00:00:00Z",
+		scopeItemIds: ["ri-new"],
+		exclusions: [{ path: "prior.md", reason: "prior report" }],
+	});
+	assert.match(result.message, /scope replaced/);
+	assert.equal(state.approvals.plan, false);
+	assert.equal(state.artifacts.plan, undefined);
+	assert.deepEqual(state.review!.scopeItemIds, ["ri-new"]);
+	state.phase = "act";
+	assert.throws(() => replaceReviewScope(state, {
+		fingerprint: "ef".repeat(32), manifest: { path: "x", sha256: "34".repeat(32) }, head: "x", unborn: false,
+		capturedAt: "x", scopeItemIds: [], exclusions: [],
+	}), /not available in phase/);
+});
+
+test("review coverage is persisted, accepted failures stay uncovered, and drift invalidates coverage", () => {
+	const state = approvedReviewState();
+	assert.deepEqual(reviewCoverage(state), { total: 2, covered: 0, uncovered: ["ri-a", "ri-b"], complete: false });
+	taskStart(state, 1);
+	taskDone(state, 1, [{ name: "batch evidence recorded", result: "pass" }]);
+	assert.deepEqual(reviewCoverage(state), { total: 2, covered: 2, uncovered: [], complete: true });
+	recordReviewDrift(state, "ef".repeat(32), ["ri-new"], [], ["ri-a"]);
+	const drifted = reviewCoverage(state);
+	assert.equal(drifted.complete, false);
+	assert.equal(drifted.covered, 1);
+	assert.deepEqual(drifted.uncovered, ["ri-a", "ri-new"]);
+	const unchanged = recordReviewDrift(state, state.review!.fingerprint, [], [], []);
+	assert.match(unchanged.message, /unchanged/);
+	assert.equal(state.review!.drift, undefined);
+
+	const accepted = approvedReviewState();
+	taskStart(accepted, 1);
+	taskDone(accepted, 1, [{ name: "evidence", result: "fail" }]);
+	taskAccept(accepted, 1, "user accepts incomplete batch");
+	assert.deepEqual(accepted.review!.uncoveredItemIds, ["ri-a", "ri-b"]);
+	assert.equal(reviewCoverage(accepted).complete, false);
 });
 
 test("approvePlan requires tasks and stays idempotent", () => {
@@ -399,6 +513,12 @@ test("consolidate_complete requires the report and completes the workflow", () =
 	} finally {
 		env.cleanup();
 	}
+});
+
+test("report-only review cannot create repair tasks", () => {
+	const s = approvedReviewState();
+	s.phase = "consolidate";
+	assert.throws(() => backToAct(s, "fix reviewed code"), /report-only/);
 });
 
 test("back_to_act creates a concrete repair task", () => {

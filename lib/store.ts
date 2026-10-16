@@ -1,4 +1,4 @@
-// RPAC durable state store — .pi/rpac/ (state schema version 2).
+// RPAC durable state store — .pi/rpac/ (state schema version 3).
 //
 // Layout:
 //   .pi/rpac/state.json         index: active workflow + per-workflow summaries
@@ -26,6 +26,7 @@ import {
 	RpacStateError,
 	validateIndex,
 	validateState,
+	RPAC_STATE_VERSION,
 } from "./schema.ts";
 import {
 	type ArtifactName,
@@ -61,7 +62,7 @@ export interface LoadResult {
 }
 
 function emptyIndex(): RpacIndex {
-	return { version: 2, active: null, workflows: {} };
+	return { version: RPAC_STATE_VERSION, active: null, workflows: {} };
 }
 
 /** Acquire the state lock, run `fn`, always release. All mutations go through this. */
@@ -75,7 +76,7 @@ function withStateLock<T>(root: string, fn: () => T): T {
 }
 
 function summaryOf(s: RpacState): WorkflowSummary {
-	return { id: s.id, task: s.task, phase: s.phase, updatedAt: s.updatedAt };
+	return { id: s.id, task: s.task, phase: s.phase, workflowKind: s.workflowKind, updatedAt: s.updatedAt };
 }
 
 function pickActive(summaries: WorkflowSummary[]): string | null {
@@ -145,7 +146,7 @@ function migrateLegacy(root: string, notes: string[]): boolean {
 	}
 	let state: RpacState;
 	try {
-		state = validateState(raw); // accepts version 1, normalizes to 2
+		state = validateState(raw); // accepts version 1, normalizes to current
 	} catch (err) {
 		if (err instanceof RpacStateError && err.code === "unsupported_version") {
 			notes.push(`legacy .pi/rpac/workflow.json: ${err.message} — left untouched`);

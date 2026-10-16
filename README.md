@@ -7,6 +7,8 @@ explicit, user-gated phase transitions.
 
 It is a *workflow state machine*, not a second agent runtime. It drives the model Pi is already
 configured with (including local OpenAI-compatible models) and coexists with your normal Pi setup.
+Alongside implementation workflows, it provides a manifest-backed, report-only self-review workflow
+for exact current, staged, or full Git scope.
 
 ```
  ┌────────┐  approve  ┌─────┐  approve  ┌──────────────────────────┐  report  ┌──────┐
@@ -49,6 +51,13 @@ configured with (including local OpenAI-compatible models) and coexists with you
   instructions are short follow-up messages; behavioral detail lives in lazily-loaded skills;
   full artifacts remain on disk rather than being injected into context; status lives in the
   footer.
+- **Manifest-backed self-review.** `/rpac review [current|staged|full]` captures a deterministic,
+  byte-safe Git snapshot, assigns every item to bounded evidence batches, validates candidate
+  findings adversarially, detects drift, and writes `review-report.md`. Review execution is
+  mechanically report-only in every phase; fixes require a separate ordinary RPAC workflow.
+- **Local-model reliability.** Review manifests, exact item assignments, per-batch evidence ledgers,
+  no-sampling rules, persisted coverage, observation checks, and explicit same-context limitations
+  keep long reviews resumable without pretending incomplete work is clean.
 - **Fresh-session handoff.** `/rpac handoff` writes a self-contained `handoff.md` and (in TUI)
   starts a fresh session seeded with it — an explicit, user-triggered continuation.
 
@@ -59,8 +68,9 @@ configured with (including local OpenAI-compatible models) and coexists with you
 - **Pi** `@earendil-works/pi-coding-agent` **1.1.0** or newer (tested against 1.1.0).
 - **Node.js** 22.6+ (type-stripping is used to run the TypeScript extension and tests directly;
   no build step needed).
-- **git** available on `PATH` (used for the baseline and divergence checks). RPAC still works in a
-  non-git directory, but baseline/divergence features are disabled.
+- **git** available on `PATH` (used for baselines, divergence, and review snapshots). Ordinary
+  `/rpac start` workflows still work in a non-git directory with baseline features disabled;
+  `/rpac review` requires a Git work tree.
 - Any model configured in Pi, including local models over OpenAI-compatible endpoints. No hosted
   model or new provider is required.
 
@@ -87,9 +97,10 @@ root.
 Two practical caveats:
 
 - Another extension must not claim the same `/rpac` command or `rpac` tool name.
-- While an RPAC workflow is in **REFINE** or **PLAN**, RPAC deliberately blocks mutating and
-  unknown custom tools to enforce read-only planning. Other extensions remain loaded, but one of
-  their tools may be refused during those phases. Normal Pi permissions apply again in **ACT**.
+- Ordinary workflows block mutating and unknown tools in **REFINE** and **PLAN**. Review workflows
+  remain report-only through **ACT** and **CONSOLIDATE** too: only the exact current review artifact,
+  known inspection tools, and user-approved non-destructive checks are allowed. Other extensions
+  remain loaded, but their tools may be refused by these fail-closed gates.
 
 If RPAC appears in both personal and project settings, Pi identifies equivalent package sources
 and avoids loading duplicate copies. A project declaration can override/filter the personal one.
@@ -161,7 +172,8 @@ pi --extension /path/to/pi-rpac/extensions/rpac.ts \
    --skill /path/to/pi-rpac/skills/rpac-refine \
    --skill /path/to/pi-rpac/skills/rpac-plan \
    --skill /path/to/pi-rpac/skills/rpac-act \
-   --skill /path/to/pi-rpac/skills/rpac-consolidate
+   --skill /path/to/pi-rpac/skills/rpac-consolidate \
+   --skill /path/to/pi-rpac/skills/rpac-review
 ```
 
 Installation never overwrites your existing Pi configuration; it only appends a package
@@ -252,6 +264,39 @@ Use `/rpac list` and `/rpac resume <id>` when the repository contains multiple s
 
 ---
 
+## Self-review workflow
+
+Start a local review from the repository you want to inspect:
+
+```text
+/rpac review          # current (default): staged + unstaged + non-ignored untracked
+/rpac review staged   # exact index bytes only; disk-only changes are excluded
+/rpac review full     # every tracked + non-ignored untracked path in the worktree
+```
+
+`current` preserves separate HEAD/index/worktree identities, so staged content later changed or
+canceled on disk is still represented. `staged` reads index blobs and never substitutes working-tree
+bytes. `full` is a repository-health review rather than a branch diff. Empty current/staged scopes
+remain valid auditable no-ops. Unborn branches, deletions, renames, modes, symlinks, gitlinks,
+binary/large content, unusual path bytes, and conflicts are represented explicitly; unresolved
+index conflicts reject `staged` review.
+
+The lifecycle remains approval-gated: REFINE discovers repository policy, intent, exact exclusions,
+and safe checks; PLAN assigns every manifest ID exactly once to bounded batches and adds adversarial
+validation; repeated ACT runs write hashed `review-batch-<id>.md` evidence; CONSOLIDATE writes
+`review-report.md`. `/rpac status`, `list`, `resume`, `pause`, `abort`, and `handoff` work for reviews
+as they do for implementation workflows.
+
+Review execution cannot modify reviewed files, Git/index/remote state, sibling repositories, or
+install tools. Only exact review artifacts and user-approved non-destructive checks are allowed.
+Snapshot drift invalidates affected coverage and must remain visible. Failed/unavailable checks,
+uncovered items, conflicts, and `same-context review; weaker independence` prevent a clean or
+approval claim. A review report records scrutiny—not merge readiness, security certification, or
+proof that no defects exist. To implement a finding, start a separate ordinary `/rpac start ...`
+workflow; the review never fixes its subject.
+
+---
+
 ## Usage — command reference
 
 Everything lives under a single command: `/rpac`. Type `/rpac` with no argument (or `/rpac
@@ -260,8 +305,9 @@ status`, `/rpac help`) to see the current state and available actions.
 | Command | What it does |
 |---|---|
 | `/rpac` | Show current workflow state and available actions. |
-| `/rpac start [--yes] <task>` | Start a new workflow. A non-terminal active workflow becomes a *saved* (resumable) workflow rather than being destroyed; headless replacement requires `--yes`. Captures a git baseline and issues the **refine** directive. |
-| `/rpac refine [notes]` | (Re)issue the refine directive. |
+| `/rpac start [--yes] <task>` | Start a new implementation workflow. A non-terminal active workflow becomes a *saved* (resumable) workflow rather than being destroyed; headless replacement requires `--yes`. Captures a git baseline and issues the **refine** directive. |
+| `/rpac review [current\|staged\|full]` | Start an approval-gated, report-only review (default: `current`). Requires a Git work tree; unsupported modes/options/base syntax are rejected. Uses the same active-workflow save/confirm safeguards as `start`. |
+| `/rpac refine [notes]` | (Re)issue the workflow-kind-specific refine directive. |
 | `/rpac plan [notes]` | Ensure the requirements are approved (dialog), then issue the **plan** directive. |
 | `/rpac act [--sequential] [task #]` | Start executing a task under the ACT execution lease. `--sequential` (or `/rpac approve sequential`) lets the model continue through ready tasks in one run. One task per run by default. |
 | `/rpac consolidate [--force]` | Issue the **consolidate** directive (verify + report). `--force` (headless) / confirm (TUI) required while tasks are unfinished. |
@@ -278,12 +324,13 @@ status`, `/rpac help`) to see the current state and available actions.
 ### The model-facing `rpac` tool
 
 The model calls a single `rpac` tool to record phase milestones (it can **request** approval but
-never grant it). Actions: `status`, `refine_complete`, `plan_complete`, `task_start`,
+never grant it). Actions: `status`, `review_scope`, `refine_complete`, `plan_complete`, `task_start`,
 `task_done` (requires `verification`; a task is `done` only when all **acceptance** checks pass;
 `observation` checks record audit findings without deciding task success; optional `deliverables`
 are hashed and tracked), `task_fail`, `task_block`, `task_unblock`, `decision`, `deviation`,
-`checkpoint`, `consolidate_complete`, `back_to_plan`, `back_to_act` (creates a concrete `Repair:`
-task).
+`checkpoint`, `consolidate_complete`, `back_to_plan`, and `back_to_act`. Review planning adds
+`reviewItemIds` and `reviewChecks`; review batches require their exact hashed evidence artifact.
+`back_to_act` creates implementation repair work only and is forbidden for report-only reviews.
 
 ### Terminal UI
 
@@ -357,7 +404,10 @@ All workflow state is under the target repository's git root, one directory **pe
 │   ├── requirements.md
 │   ├── plan.md
 │   ├── log.md        #   append-only decisions, deviations, checkpoints (bounded)
-│   ├── report.md
+│   ├── report.md              # ordinary implementation completion report
+│   ├── review-manifest.json   # review only: deterministic scope + layer identities
+│   ├── review-batch-<id>.md   # review only: per-task evidence ledger
+│   ├── review-report.md       # review only: final report + limitations
 │   └── handoff.md
 ├── quarantine/       # corrupt files, never crash-looped (surfaced as notes)
 ├── .lock             # atomic write lock {token, pid, createdAt} (transient)
@@ -398,12 +448,12 @@ pi update pi-rpac
 /reload                       # in a running session, to pick up code changes
 ```
 
-State is versioned (`version: 2` in each `workflow.json`, `version: 2` in `state.json`).
-Version-1 (shared-layout) state from an earlier RPAC is **migrated automatically on first use** —
-artifacts move into the workflow's directory and the move is recorded in the workflow log. A
-version newer than the current one is rejected with a clear error rather than silently
-mis-parsed; corrupt files are quarantined (under `.pi/rpac/quarantine/`) and reported, never
-crash-looped.
+State is versioned (`version: 3` in each `workflow.json` and `state.json`). Versions 1 and 2 load
+as ordinary implementation workflows and migrate to the current shape; the legacy version-1
+shared layout is moved into a workflow directory with the migration recorded in its log. Version 3
+adds the workflow kind and durable review snapshot/coverage/check metadata. A version newer than
+the current one is rejected rather than silently discarding review state; corrupt files are
+quarantined under `.pi/rpac/quarantine/` and reported, never crash-looped.
 
 ---
 
@@ -436,20 +486,23 @@ the takeover of the same stale lock (exactly one winner). `test/e2e/workflow.tes
 real `extensions/rpac.ts` factory against a mock `ExtensionAPI` and drives the full command +
 tool interface — two-task non-sequential ACT, failed/unavailable/blocked/interrupted outcomes,
 sequential stop, headless refusals, the repair flow, stale detection, handoff, project
-isolation, workflow switching, v1 migration, and corruption quarantine. `test/e2e/realpi.test.ts`
-runs ONE complete workflow through the **actual installed Pi binary** in RPC mode against a
-stateful mock OpenAI-compatible model (real `write`/`bash` tool calls, real confirm dialogs,
-real on-disk state). `test/smoke/smoke.sh` verifies loading against the installed Pi.
+isolation, workflow switching, migration, corruption quarantine, all review modes, interruption,
+drift, conflict rejection, and report-only gates. `test/e2e/realpi.test.ts` copies the package
+outside the checkout and runs it through the **actual installed Pi binary** in RPC mode against a
+stateful mock OpenAI-compatible model (real tools/dialogs/state), verifies the bundled review
+skill/license, dispatches `/rpac review`, and checks HEAD/index/content invariants.
+`test/smoke/smoke.sh` repeats copied-package start/review and mutation invariants in installed Pi.
 The real-Pi e2e is skipped automatically when `pi` is not on `PATH`.
 
 **Layout:** see [DESIGN.md](DESIGN.md) for the architecture, API grounding, and test strategy.
 
 - `extensions/rpac.ts` — the only file that touches Pi APIs (command, tool, events, UI).
 - `lib/` — `schema` (state types/validation), `machine` (transitions + guards), `store`
-  (atomic writes + lock), `git` (baseline/divergence), `prompts` (phase directives), `paths`,
+  (atomic writes + lock), `git` (baseline/divergence), `review` (byte-safe Git snapshots),
+  `gating` (ordinary planning + report-only review gates), `prompts` (phase directives), `paths`,
   `util`.
-- `skills/` — `rpac-refine`, `rpac-plan`, `rpac-act`, `rpac-consolidate` (lazily-loaded,
-  model-facing behavioral detail).
+- `skills/` — `rpac-refine`, `rpac-plan`, `rpac-act`, `rpac-consolidate`, and the bundled
+  `rpac-review` adaptation with its adjacent upstream MIT license (lazily-loaded behavioral detail).
 
 ---
 
@@ -474,6 +527,15 @@ version. Don't edit it by hand across versions; restore from your backup or star
 state keeps working. **"…was quarantined"** means exactly this; the quarantined file is preserved
 for inspection. **Note: migration …** means version-1 state was migrated into the per-workflow
 layout on first use.
+
+**`/rpac review` rejects the directory or mode** — Review supports only `current`, `staged`, and
+`full` and requires a Git work tree. Branch/base/PR syntax and extra options are intentionally not
+accepted. Resolve unmerged index entries before an exact `staged` review.
+
+**A review reports drift/uncovered items** — The selected Git snapshot changed after capture.
+Affected coverage is invalidated rather than silently reused. Replan/review the delta or finish with
+an explicitly incomplete `review-report.md`; do not treat it as clean. Review fixes belong in a
+separate `/rpac start` workflow.
 
 **"… requires approved requirements / plan"** — An approval gate is outstanding. Approve with the
 dialog or `/rpac approve requirements` / `/rpac approve plan`. The model cannot self-approve.
@@ -520,14 +582,17 @@ pass stops the run; non-blocking observations do not.
   trigger it (TUI). There are no background agents.
 - **Approvals are user actions.** The model can finish and request, but a human approves
   requirements, the plan, and sequential mode. The model can never self-approve.
-- **REFINE and PLAN are mechanically read-only.** While the phase is `refine` or `plan`, the
-  extension allows `write`/`edit` only for the exact phase artifact, restricts shell commands
-  to conservative read-only forms, permits known inspection tools plus nested-call-gated
-  `codemode`, and blocks unknown custom tools. ACT is under normal Pi permissions.
+- **Ordinary REFINE and PLAN are mechanically read-only.** The extension permits only the exact
+  phase artifact, conservative inspection, and known read-only tools. Ordinary ACT returns to
+  normal Pi permissions.
+- **Review is mechanically report-only throughout.** Review ACT/CONSOLIDATE can write only the
+  current batch/report artifact and run exact approved non-destructive checks. Semantic review is
+  still model work: complete ledgers and adversarial validation improve reliability but cannot
+  prove a repository defect-free.
 - **No auto commit/push/merge/publish.** Consolidation reports; you decide.
-- **Baseline is a snapshot, not a monitor.** Drift (changed artifacts, moved git HEAD, new
-  uncommitted files) is checked at `status`/`resume`/`act` boundaries, never auto-resolved.
-  RPAC's own `.pi/rpac/` churn is excluded from the divergence report.
+- **Snapshots are boundary checks, not continuous monitors.** Ordinary divergence and exact review
+  drift are checked at lifecycle boundaries and completion, never auto-resolved. RPAC's own
+  `.pi/rpac/` churn is excluded.
 - **One active workflow, many saved.** A repo has one *active* workflow at a time; all others
   stay resumable (`/rpac list`, `/rpac resume <id>`).
 
@@ -543,6 +608,15 @@ directives are short; detail is in skills loaded only when the task calls for th
   `refine-ticket`, `create-implementation-plan`, `split-plan-tasks`, `execute-plan-tasks`,
   `harden-artifact`, `handover`, and `prepare-prompt` skills of
   [eai-org/agent-toolkit](https://github.com/eai-org/agent-toolkit), MIT License,
-  Copyright (c) 2026 Engineering in the age of AI. Only concepts were adapted; no code was copied,
-  and no files from that toolkit are bundled.
+  Copyright (c) 2026 Engineering in the age of AI. For these ordinary RPAC phase behaviors, only
+  concepts were adapted; no toolkit phase files are bundled. The review derivative below is a
+  separate, explicitly bundled adaptation with its own preserved adjacent license.
+- The bundled [`rpac-review`](skills/rpac-review/SKILL.md) skill is an adapted derivative of
+  Engineering in the age of AI's MIT-licensed
+  [`self-review`](https://github.com/eai-org/agent-toolkit/blob/main/skills/self-review/SKILL.md)
+  and
+  [`fresh-eyes-review`](https://github.com/eai-org/agent-toolkit/blob/main/skills/fresh-eyes-review/SKILL.md).
+  Its exact upstream license and `Copyright (c) 2026 Engineering in the age of AI` are preserved
+  adjacent to the skill at [`skills/rpac-review/LICENSE`](skills/rpac-review/LICENSE). The bundled
+  adaptation is self-contained; no upstream/global review skill is required at runtime.
 - This project is released under the **MIT License** (see [LICENSE](LICENSE)).

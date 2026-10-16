@@ -61,6 +61,58 @@ Read and follow the \`rpac-consolidate\` skill. Compare the result against the a
 If you find a problem, call the \`rpac\` tool with action "back_to_act" (creates a repair task) or "back_to_plan" (the plan itself was wrong). When the report is written and the outcome is sound, call the \`rpac\` tool with action "consolidate_complete".`;
 }
 
+export function reviewRefineDirective(mode: string, requirementsAbs: string, manifestRel: string): string {
+	return `RPAC · REVIEW REFINE. Ground and define a report-only ${mode} self-review.
+
+Scope manifest: \`${manifestRel}\`
+
+Read and follow the \`rpac-review\` skill, section REFINE. Discover repository policy and intent, account for every manifest item, name exact exclusions and safe project checks, and write \`${requirementsAbs}\` only. The reviewed project and Git state are read-only.
+When ready, call the \`rpac\` tool with action "refine_complete". The user must approve before planning.`;
+}
+
+export function reviewPlanDirective(mode: string, planAbs: string, requirementsRel: string, manifestRel: string): string {
+	return `RPAC · REVIEW PLAN. Create bounded coverage batches for the approved ${mode} review.
+
+Requirements: \`${requirementsRel}\` · Scope manifest: \`${manifestRel}\`
+
+Read and follow the \`rpac-review\` skill, section PLAN. Write \`${planAbs}\` only. Assign every manifest item id exactly once across coherent review batches, then add an adversarial finding-validation task. List only safe project checks that need plan approval.
+Call the \`rpac\` tool with action "plan_complete", including task dependencies, reviewItemIds, and reviewChecks. The user must approve the plan.`;
+}
+
+export function reviewActDirective(
+	mode: string,
+	taskId: number,
+	taskTitle: string,
+	itemIds: string[],
+	batchRel: string,
+	planRel: string,
+	sequential: boolean,
+): string {
+	return `RPAC · REVIEW ACT. Execute review task #${taskId}${sequential ? "; sequential mode may continue after verified completion" : ""}.
+
+Mode: ${mode} · Plan: \`${planRel}\` · Task: ${taskTitle}
+Assigned manifest items: ${itemIds.length ? itemIds.join(", ") : "none (validation/finalization task)"}
+
+Read and follow the \`rpac-review\` skill, section ACT. Inspect exact snapshot layers, record evidence and validated candidate findings in \`${batchRel}\`, and do not modify reviewed files or Git state. This task is already in progress; do not call task_start.
+Call \`task_done\` with the batch artifact as a deliverable and a passing acceptance check only after its assigned coverage/evidence is complete. Subject defects are observation results.${sequential ? " Then call task_start for the next ready task." : " Stop after this task."}`;
+}
+
+export function reviewConsolidateDirective(
+	mode: string,
+	reportAbs: string,
+	requirementsRel: string,
+	planRel: string,
+	manifestRel: string,
+	logRel: string,
+): string {
+	return `RPAC · REVIEW CONSOLIDATE. Validate findings and write the final report-only ${mode} review.
+
+Requirements: \`${requirementsRel}\` · Plan: \`${planRel}\` · Manifest: \`${manifestRel}\` · Log: \`${logRel}\`
+
+Read and follow the \`rpac-review\` skill, section CONSOLIDATE. Recheck the selected snapshot, verify coverage and each candidate against exact context, and write \`${reportAbs}\` only. Missing coverage, drift, failed checks, or same-context review must remain visible; never claim approval or merge readiness.
+Fixes are out of scope and require a separate ordinary RPAC workflow. Call \`consolidate_complete\` when the honest report is complete; use \`back_to_plan\` only when review coverage itself must be replanned.`;
+}
+
 export function resumeDirective(task: string, phase: string, detail: string, stateRel: string): string {
 	return `RPAC · RESUME. The workflow is in phase "${phase}".
 
@@ -82,6 +134,24 @@ export function phaseContext(state: RpacState, root: string): string | null {
 	const reportAbs = artifactFile(root, state.id, "report");
 	const done = state.tasks.filter((t) => t.status === "done").length;
 	const taskPart = state.tasks.length > 0 ? ` tasks ${done}/${state.tasks.length} done` : "";
+	if (state.workflowKind === "review" && state.review) {
+		const manifest = state.review.manifest.path;
+		const reviewReport = `.pi/rpac/${state.id}/review-report.md`;
+		switch (state.phase) {
+			case "refine":
+				return `[RPAC REVIEW] phase=REFINE mode=${state.review.mode}${taskPart}\nManifest: ${manifest}. Write review requirements to ${reqAbs}; reviewed files and Git are read-only.\nFollow rpac-review REFINE; call refine_complete when ready.`;
+			case "plan":
+				return `[RPAC REVIEW] phase=PLAN mode=${state.review.mode}${taskPart}\nRequirements: ${reqAbs}. Manifest: ${manifest}. Write ${planAbs}; assign every item id exactly once.\nFollow rpac-review PLAN; call plan_complete with reviewItemIds and reviewChecks.`;
+			case "act": {
+				const current = state.tasks.find((t) => t.status === "in_progress");
+				return `[RPAC REVIEW] phase=ACT mode=${state.review.mode}${taskPart}${current ? ` current task #${current.id}: ${current.title}` : " no task started — user runs /rpac act"}\nReviewed files and Git are mechanically read-only. Follow rpac-review ACT; persist batch evidence and report via task_done.`;
+			}
+			case "consolidate":
+				return `[RPAC REVIEW] phase=CONSOLIDATE mode=${state.review.mode}${taskPart}\nRecheck ${manifest}, validate coverage/findings, and write ${reviewReport}. Report limitations; never fix or claim approval.\nFollow rpac-review CONSOLIDATE; call consolidate_complete when honest.`;
+			default:
+				return null;
+		}
+	}
 	switch (state.phase) {
 		case "refine":
 			return `[RPAC] phase=REFINE${taskPart} — task: "${state.task}"

@@ -1,6 +1,6 @@
 // RPAC paths — project-local, human-readable layout under .pi/rpac/.
 //
-// Layout (state schema version 2):
+// Layout (state schema version 3):
 //   .pi/rpac/state.json        top-level index (active workflow + summaries)
 //   .pi/rpac/.lock             exclusive state lock
 //   .pi/rpac/.act-lease        ACT execution lease
@@ -29,6 +29,16 @@ export function artifactFile(root: string, id: string, name: ArtifactName): stri
 }
 export function logFile(root: string, id: string): string {
 	return artifactFile(root, id, "log");
+}
+export function reviewManifestFile(root: string, id: string): string {
+	return join(workflowDir(root, id), "review-manifest.json");
+}
+export function reviewBatchFile(root: string, id: string, taskId: number): string {
+	if (!Number.isInteger(taskId) || taskId < 1) throw new Error(`invalid review task id: ${taskId}`);
+	return join(workflowDir(root, id), `review-batch-${taskId}.md`);
+}
+export function reviewReportFile(root: string, id: string): string {
+	return join(workflowDir(root, id), "review-report.md");
 }
 export function quarantineDir(root: string): string {
 	return join(rpacDir(root), "quarantine");

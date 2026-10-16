@@ -763,3 +763,283 @@ test("abort headless requires --yes; cleanup headless requires --yes", async () 
 	assert.ok(existsSync(join(repo, ".pi", "rpac")), "empty lock directory retained");
 	assert.deepEqual(readdirSync(join(repo, ".pi", "rpac")), [], "all RPAC state removed");
 });
+
+// ---------------------------------------------------------------------------
+// Report-only review workflow
+// ---------------------------------------------------------------------------
+
+test("/rpac review drives a manifest-backed report-only workflow through resume-safe phases", async () => {
+	const reviewRepo = makeTempDir("rpac-review-e2e-");
+	const reviewPi = makeMockPi();
+	try {
+		mkdirSync(join(reviewRepo, "src"), { recursive: true });
+		writeFileSync(join(reviewRepo, "src", "app.ts"), "export const value = 1;\n");
+		execFileSync("git", ["init", "-q"], { cwd: reviewRepo });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: reviewRepo });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: reviewRepo });
+		execFileSync("git", ["add", "-A"], { cwd: reviewRepo });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: reviewRepo });
+		writeFileSync(join(reviewRepo, "src", "app.ts"), "export const value = 2;\n");
+		execFileSync("git", ["add", "--", "src/app.ts"], { cwd: reviewRepo });
+		writeFileSync(join(reviewRepo, "src", "app.ts"), "export const value = 3;\n");
+		writeFileSync(join(reviewRepo, "notes.txt"), "review me\n");
+		rpacExtension(extensionApiFor(reviewPi));
+
+		const started = await rpacCmd(reviewPi, reviewRepo, "review");
+		const id = activeWorkflowId(reviewRepo);
+		let reviewState = readState(reviewRepo, id);
+		assert.equal(reviewState.workflowKind, "review");
+		assert.equal(reviewState.review.mode, "current");
+		assert.ok(reviewState.review.scopeItemIds.length >= 2);
+		assert.ok(existsSync(join(workflowDirPath(reviewRepo, id), "review-manifest.json")));
+		assert.match(reviewPi.userMessages.at(-1)!, /REVIEW REFINE/);
+		assert.match(started.ui.text("info").join("\n"), /scope: .*item/);
+		const status = await rpacCmd(reviewPi, reviewRepo, "status");
+		assert.match(status.ui.text("info").join("\n"), /Active workflow .*review \(current\)/);
+		const listed = await rpacCmd(reviewPi, reviewRepo, "list");
+		assert.match(listed.ui.text("info").join("\n"), /review:refine/);
+		const scoped = await rpacTool(reviewPi, reviewRepo, {
+			action: "review_scope",
+			exclusions: [{ path: "notes.txt", reason: "local scratch note" }],
+		});
+		assert.match(scoped, /scope replaced/);
+		reviewState = readState(reviewRepo, id);
+		assert.deepEqual(reviewState.review.exclusions, [{ path: "notes.txt", reason: "local scratch note" }]);
+
+		const req = [
+			"# Review requirements",
+			"## Intent",
+			"Review the captured current changes for concrete correctness and policy violations.",
+			"## Scope",
+			"Every manifest item is included; no project-specific exclusions are needed.",
+			"## Acceptance",
+			"Every item receives evidence and findings are adversarially validated.",
+		].join("\n");
+		writeArtifact(reviewRepo, "requirements", req, id);
+		await rpacTool(reviewPi, reviewRepo, { action: "refine_complete" }, { confirm: [true] });
+		const manifest = JSON.parse(readFileSync(join(workflowDirPath(reviewRepo, id), "review-manifest.json"), "utf8"));
+		const itemIds = manifest.items.map((entry: { id: string }) => entry.id);
+		const plan = [
+			"# Review plan",
+			"## Summary",
+			"Inspect the captured files in one bounded batch, then validate candidate findings.",
+			"## Conventions",
+			"Report-only; preserve exact snapshot semantics and evidence.",
+			"## Tasks",
+			"- [ ] Review captured items",
+			"- [ ] Validate findings and coverage",
+		].join("\n");
+		writeArtifact(reviewRepo, "plan", plan, id);
+		const planned = await rpacTool(reviewPi, reviewRepo, {
+			action: "plan_complete",
+			tasks: [
+				{ title: "Review captured items", reviewItemIds: itemIds },
+				{ title: "Validate findings and coverage", dependsOn: [1] },
+			],
+			reviewChecks: ["npm test"],
+		}, { confirm: [true] });
+		assert.match(planned, /approved/i);
+
+		await rpacCmd(reviewPi, reviewRepo, "act");
+		reviewState = readState(reviewRepo, id);
+		assert.equal(reviewState.tasks[0].status, "in_progress");
+		assert.match(reviewPi.userMessages.at(-1)!, /REVIEW ACT/);
+		const gate = async (toolName: string, input: Record<string, unknown>) =>
+			fire(reviewPi, "tool_call", { type: "tool_call", toolName, input }, { cwd: reviewRepo }) as Promise<unknown>;
+		assert.ok(((await gate("write", { path: join(reviewRepo, "src", "app.ts"), content: "bad" })) as { block?: boolean }).block);
+		assert.equal(((await gate("bash", { command: "npm test" })) as { block?: boolean } | undefined)?.block, undefined);
+		assert.ok(((await gate("bash", { command: "git add -A" })) as { block?: boolean }).block);
+		await fire(reviewPi, "agent_end", { type: "agent_end" }, makeCommandCtx(reviewPi, reviewRepo) as never);
+		assert.equal(readState(reviewRepo, id).tasks[0].status, "interrupted");
+		await rpacCmd(reviewPi, reviewRepo, `resume ${id}`);
+		assert.match(reviewPi.userMessages.at(-1)!, /REVIEW ACT/);
+		assert.equal(readState(reviewRepo, id).review.fingerprint, reviewState.review.fingerprint, "snapshot identity survived resume");
+		const batch1 = join(workflowDirPath(reviewRepo, id), "review-batch-1.md");
+		writeFileSync(batch1, "# Batch 1\n\nAll assigned manifest items inspected.\n\nCandidate: example subject check failed.\n");
+		const done1 = await rpacTool(reviewPi, reviewRepo, {
+			action: "task_done",
+			task: 1,
+			verification: [
+				{ name: "example subject check", kind: "observation", result: "fail", detail: "recorded as a candidate" },
+				{ name: "batch evidence complete", kind: "acceptance", result: "pass" },
+			],
+			deliverables: [batch1],
+		});
+		assert.match(done1, /complete/);
+		await fire(reviewPi, "agent_end", { type: "agent_end" }, makeCommandCtx(reviewPi, reviewRepo) as never);
+
+		await rpacCmd(reviewPi, reviewRepo, "act");
+		const batch2 = join(workflowDirPath(reviewRepo, id), "review-batch-2.md");
+		writeFileSync(batch2, "# Batch 2\n\nCandidate rechecked against exact context; coverage ledger complete.\n");
+		await rpacTool(reviewPi, reviewRepo, {
+			action: "task_done",
+			task: 2,
+			verification: [{ name: "adversarial validation recorded", result: "pass" }],
+			deliverables: [batch2],
+		});
+		await fire(reviewPi, "agent_end", { type: "agent_end" }, makeCommandCtx(reviewPi, reviewRepo) as never);
+		reviewState = readState(reviewRepo, id);
+		assert.equal(reviewState.review.coveredItemIds.length, itemIds.length);
+
+		await rpacCmd(reviewPi, reviewRepo, "consolidate");
+		assert.match(reviewPi.userMessages.at(-1)!, /REVIEW CONSOLIDATE/);
+		const report = join(workflowDirPath(reviewRepo, id), "review-report.md");
+		writeFileSync(report, "# Review report\n\nScope complete; one validated finding. This records scrutiny, not approval.\n");
+		const completed = await rpacTool(reviewPi, reviewRepo, { action: "consolidate_complete", text: "report complete" });
+		assert.match(completed, /Review workflow complete/);
+		reviewState = readState(reviewRepo, id);
+		assert.equal(reviewState.phase, "done");
+		assert.match(reviewState.artifacts.report.path, /review-report\.md$/);
+		assert.ok(reviewState.tasks.at(-1).deliverables.some((entry: { path: string }) => /review-report\.md$/.test(entry.path)), "final report is a hashed deliverable");
+		assert.equal(readFileSync(join(reviewRepo, "src", "app.ts"), "utf8"), "export const value = 3;\n", "review did not edit source");
+	} finally {
+		removeTree(reviewRepo);
+	}
+});
+
+
+test("review drift invalidates covered items and remains explicit in an incomplete final report", async () => {
+	const root = makeTempDir("rpac-review-drift-");
+	const localPi = makeMockPi();
+	try {
+		writeFileSync(join(root, "app.txt"), "base\n");
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: root });
+		execFileSync("git", ["add", "-A"], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+		writeFileSync(join(root, "app.txt"), "reviewed version\n");
+		rpacExtension(extensionApiFor(localPi));
+		await rpacCmd(localPi, root, "review current");
+		const id = activeWorkflowId(root);
+		writeArtifact(root, "requirements", [
+			"# Review requirements",
+			"## Intent",
+			"Review the captured app change for concrete correctness under repository policy.",
+			"## Scope",
+			"Every manifest item is included without exclusions.",
+			"## Acceptance",
+			"Persist evidence and report any drift as incomplete coverage.",
+		].join("\n"), id);
+		await rpacTool(localPi, root, { action: "refine_complete" }, { confirm: [true] });
+		const manifest = JSON.parse(readFileSync(join(workflowDirPath(root, id), "review-manifest.json"), "utf8"));
+		const ids = manifest.items.map((item: { id: string }) => item.id);
+		writeArtifact(root, "plan", [
+			"# Review plan",
+			"## Summary",
+			"Inspect all captured content, retain evidence, and validate the final coverage ledger.",
+			"## Tasks",
+			"- [ ] Inspect the complete captured scope and validate findings",
+			"  - Done when: all manifest IDs have durable evidence",
+		].join("\n"), id);
+		await rpacTool(localPi, root, {
+			action: "plan_complete",
+			tasks: [{ title: "Inspect scope and validate findings", reviewItemIds: ids }],
+		}, { confirm: [true] });
+		await rpacCmd(localPi, root, "act");
+		const batch = join(workflowDirPath(root, id), "review-batch-1.md");
+		writeFileSync(batch, "# Batch evidence\n\nAll assigned bytes inspected; no supported finding.\n");
+		await rpacTool(localPi, root, {
+			action: "task_done",
+			task: 1,
+			verification: [{ name: "complete evidence ledger", result: "pass" }],
+			deliverables: [batch],
+		});
+		await fire(localPi, "agent_end", { type: "agent_end" }, makeCommandCtx(localPi, root) as never);
+		assert.deepEqual(readState(root, id).review.coveredItemIds, ids);
+
+		writeFileSync(join(root, "app.txt"), "changed during review\n");
+		const consolidate = await rpacCmd(localPi, root, "consolidate");
+		assert.match(consolidate.ui.text("warning").join("\n"), /drift/i);
+		let s = readState(root, id);
+		assert.ok(s.review.drift);
+		assert.equal(s.review.coveredItemIds.length, 0);
+		assert.deepEqual(s.review.uncoveredItemIds, ids);
+		const report = join(workflowDirPath(root, id), "review-report.md");
+		writeFileSync(report, "# Review report\n\n## Outcome\nIncomplete because the reviewed file drifted. Scrutiny, not approval.\n\n## Limitations\nThe changed manifest item is uncovered.\n");
+		const result = await rpacTool(localPi, root, { action: "consolidate_complete", text: "incomplete drift report" });
+		assert.match(result, /drift/i);
+		s = readState(root, id);
+		assert.equal(s.phase, "done");
+		assert.ok(s.review.drift, "drift remains persisted at completion");
+	} finally {
+		removeTree(root);
+	}
+});
+
+test("staged review rejects an unresolved index conflict without creating review state", async () => {
+	const root = makeTempDir("rpac-review-conflict-");
+	const localPi = makeMockPi();
+	try {
+		writeFileSync(join(root, "conflict.txt"), "base\n");
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: root });
+		execFileSync("git", ["add", "-A"], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+		const mainBranch = execFileSync("git", ["branch", "--show-current"], { cwd: root, encoding: "utf8" }).trim();
+		execFileSync("git", ["checkout", "-qb", "side"], { cwd: root });
+		writeFileSync(join(root, "conflict.txt"), "side\n");
+		execFileSync("git", ["commit", "-qam", "side"], { cwd: root });
+		execFileSync("git", ["checkout", "-q", mainBranch], { cwd: root });
+		writeFileSync(join(root, "conflict.txt"), "main\n");
+		execFileSync("git", ["commit", "-qam", "main"], { cwd: root });
+		assert.throws(() => execFileSync("git", ["merge", "side"], { cwd: root, stdio: "pipe" }));
+		rpacExtension(extensionApiFor(localPi));
+		const result = await rpacCmd(localPi, root, "review staged");
+		assert.match(result.ui.text("error").join("\n"), /resolve unmerged index entries/i);
+		assert.equal(existsSync(join(root, ".pi", "rpac", "state.json")), false);
+	} finally {
+		removeTree(root);
+	}
+});
+
+test("/rpac review accepts all modes and preserves an empty current/staged scope", async () => {
+	const root = makeTempDir("rpac-review-modes-");
+	const localPi = makeMockPi();
+	try {
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: root });
+		writeFileSync(join(root, "a.txt"), "a\n");
+		execFileSync("git", ["add", "-A"], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+		rpacExtension(extensionApiFor(localPi));
+		for (const mode of ["current", "staged", "full"] as const) {
+			await rpacCmd(localPi, root, `review ${mode}`);
+			const current = readState(root);
+			assert.equal(current.review.mode, mode);
+			assert.equal(current.review.scopeItemIds.length, mode === "full" ? 1 : 0);
+			await rpacCmd(localPi, root, "abort --yes mode checked", { hasUI: false });
+		}
+	} finally {
+		removeTree(root);
+	}
+});
+
+test("/rpac review rejects invalid syntax/non-git roots and headless active replacement", async () => {
+	const root = makeTempDir("rpac-review-errors-");
+	const localPi = makeMockPi();
+	try {
+		rpacExtension(extensionApiFor(localPi));
+		let ctx = await rpacCmd(localPi, root, "review branch main");
+		assert.match(ctx.ui.text("error").join("\n"), /Usage/);
+		assert.equal(existsSync(join(root, ".pi", "rpac", "state.json")), false);
+		ctx = await rpacCmd(localPi, root, "review");
+		assert.match(ctx.ui.text("error").join("\n"), /Git work tree/);
+
+		execFileSync("git", ["init", "-q"], { cwd: root });
+		execFileSync("git", ["config", "user.email", "t@t"], { cwd: root });
+		execFileSync("git", ["config", "user.name", "t"], { cwd: root });
+		writeFileSync(join(root, "a.txt"), "a\n");
+		execFileSync("git", ["add", "-A"], { cwd: root });
+		execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+		await rpacCmd(localPi, root, "start active task");
+		const active = activeWorkflowId(root);
+		ctx = await rpacCmd(localPi, root, "review staged", { hasUI: false });
+		assert.match(ctx.ui.text("error").join("\n"), /active workflow.*abort\/finish/i);
+		assert.equal(activeWorkflowId(root), active);
+	} finally {
+		removeTree(root);
+	}
+});

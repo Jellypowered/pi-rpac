@@ -158,10 +158,18 @@ export function approveRequirements(s: RpacState): MachineResult {
 export interface PlanTaskSpec {
 	title: string;
 	dependsOn?: number[];
+	/** stable manifest ids assigned to this batch (review workflows only) */
+	reviewItemIds?: string[];
 }
 
 /** Model finished the plan. Requires plan artifact + a non-empty, valid task graph. */
-export function planComplete(s: RpacState, planPath: string, tasks: PlanTaskSpec[], relPath = "plan.md"): MachineResult {
+export function planComplete(
+	s: RpacState,
+	planPath: string,
+	tasks: PlanTaskSpec[],
+	relPath = "plan.md",
+	reviewChecks: string[] = [],
+): MachineResult {
 	requirePhase(s, ["plan"], "plan_complete");
 	requireNotPaused(s, "to finish planning");
 	requireRequirementsApproved(s, "plan_complete");
@@ -185,6 +193,22 @@ export function planComplete(s: RpacState, planPath: string, tasks: PlanTaskSpec
 	} catch (err) {
 		throw new RpacGuardError(`invalid task graph: ${(err as Error).message}`);
 	}
+	if (s.workflowKind === "review") {
+		if (!s.review) throw new RpacGuardError("review workflow is missing its captured scope");
+		const expected = new Set(s.review.scopeItemIds);
+		const assigned = new Set<string>();
+		for (let i = 0; i < tasks.length; i++) {
+			for (const id of tasks[i]!.reviewItemIds ?? []) {
+				if (!expected.has(id)) throw new RpacGuardError(`review task ${i + 1} references unknown manifest item ${id}`);
+				if (assigned.has(id)) throw new RpacGuardError(`review manifest item ${id} is assigned more than once`);
+				assigned.add(id);
+			}
+		}
+		const missing = [...expected].filter((id) => !assigned.has(id));
+		if (missing.length > 0) {
+			throw new RpacGuardError(`review plan leaves ${missing.length} manifest item(s) unassigned: ${missing.slice(0, 8).join(", ")}`);
+		}
+	}
 	const completed = s.tasks.filter((t) => t.status === "done");
 	if (completed.length > 0) {
 		const supersededAt = nowIso();
@@ -194,6 +218,7 @@ export function planComplete(s: RpacState, planPath: string, tasks: PlanTaskSpec
 				verification: task.verification?.map((check) => ({ ...check })),
 				issues: task.issues ? [...task.issues] : undefined,
 				dependsOn: task.dependsOn ? [...task.dependsOn] : undefined,
+				reviewItemIds: task.reviewItemIds ? [...task.reviewItemIds] : undefined,
 				supersededAt,
 				reason: "plan superseded after back_to_plan",
 			});
@@ -205,13 +230,20 @@ export function planComplete(s: RpacState, planPath: string, tasks: PlanTaskSpec
 	}
 	s.tasks = tasks.map((t, i) => {
 		const depList = (deps[i] ?? []).filter((d) => d >= 1 && d <= n && d !== i + 1);
+		const reviewItemIds = [...new Set(t.reviewItemIds ?? [])];
 		return {
 			id: i + 1,
 			title: String(t.title ?? `Task ${i + 1}`).trim(),
 			status: "pending" as const,
 			...(depList.length > 0 ? { dependsOn: depList } : {}),
+			...(s.workflowKind === "review" && reviewItemIds.length > 0 ? { reviewItemIds } : {}),
 		};
 	});
+	if (s.review) {
+		s.review.coveredItemIds = [];
+		s.review.uncoveredItemIds = [];
+		s.review.approvedChecks = [...new Set(reviewChecks.map((check) => check.trim()).filter(Boolean))];
+	}
 	pushEvent(s, "plan_complete", `plan finalized with ${s.tasks.length} tasks`);
 	return {
 		state: s,
@@ -388,6 +420,12 @@ export function taskDone(
 
 	task.status = "done";
 	task.doneAt = nowIso();
+	if (s.review && task.reviewItemIds?.length) {
+		const covered = new Set(s.review.coveredItemIds);
+		for (const id of task.reviewItemIds) covered.add(id);
+		s.review.coveredItemIds = [...covered].sort();
+		s.review.uncoveredItemIds = s.review.uncoveredItemIds.filter((id) => !covered.has(id));
+	}
 	if (issues.length > 0) {
 		task.issues = issues;
 		pushEvent(s, "task_issues", `task ${task.id}: ${issues.join("; ")}`);
@@ -405,6 +443,91 @@ export function taskDone(
 		message += " Stop and wait for /rpac act (or /rpac act --sequential) before the next task.";
 	}
 	return { state: s, message };
+}
+
+export interface ReviewCoverage {
+	total: number;
+	covered: number;
+	uncovered: string[];
+	complete: boolean;
+}
+
+export function reviewCoverage(s: RpacState): ReviewCoverage {
+	if (!s.review) return { total: 0, covered: 0, uncovered: [], complete: true };
+	const expected = new Set(s.review.scopeItemIds);
+	const covered = new Set(s.review.coveredItemIds.filter((id) => expected.has(id)));
+	const uncovered = new Set(s.review.uncoveredItemIds);
+	for (const id of expected) if (!covered.has(id)) uncovered.add(id);
+	return {
+		total: expected.size,
+		covered: covered.size,
+		uncovered: [...uncovered].sort(),
+		complete: uncovered.size === 0 && !s.review.drift,
+	};
+}
+
+export interface ReviewScopeUpdate {
+	fingerprint: string;
+	manifest: RpacArtifact;
+	head: string;
+	unborn: boolean;
+	capturedAt: string;
+	scopeItemIds: string[];
+	exclusions: { path: string; reason: string }[];
+}
+
+/** Replace review scope during refinement/replanning after explicit recapture. */
+export function replaceReviewScope(s: RpacState, update: ReviewScopeUpdate): MachineResult {
+	requirePhase(s, ["refine", "plan"], "replace review scope");
+	if (s.workflowKind !== "review" || !s.review) throw new RpacGuardError("review scope can only be replaced on a review workflow");
+	if (!/^[0-9a-f]{64}$/.test(update.fingerprint) || !/^[0-9a-f]{64}$/.test(update.manifest.sha256)) {
+		throw new RpacGuardError("review scope requires valid SHA-256 identities");
+	}
+	s.review.fingerprint = update.fingerprint;
+	s.review.manifest = { ...update.manifest };
+	s.review.head = update.head;
+	s.review.unborn = update.unborn;
+	s.review.capturedAt = update.capturedAt;
+	s.review.scopeItemIds = [...new Set(update.scopeItemIds)];
+	s.review.coveredItemIds = [];
+	s.review.uncoveredItemIds = [];
+	s.review.exclusions = update.exclusions.map((entry) => ({ ...entry }));
+	s.review.drift = undefined;
+	s.artifacts.reviewManifest = { ...update.manifest };
+	if (s.phase === "plan") {
+		s.approvals.plan = false;
+		s.artifacts.plan = undefined;
+	}
+	pushEvent(s, "review_scope", `review scope recaptured with ${s.review.scopeItemIds.length} item(s)`);
+	return { state: s, message: `Review scope replaced (${s.review.scopeItemIds.length} item(s)); plan coverage must be regenerated.` };
+}
+
+/** Persist relevant snapshot drift and invalidate coverage for affected items. */
+export function recordReviewDrift(
+	s: RpacState,
+	fingerprint: string,
+	addedItemIds: string[],
+	removedItemIds: string[],
+	changedItemIds: string[],
+): MachineResult {
+	if (s.workflowKind !== "review" || !s.review) throw new RpacGuardError("review drift can only be recorded on a review workflow");
+	const affected = new Set([...addedItemIds, ...removedItemIds, ...changedItemIds]);
+	if (fingerprint === s.review.fingerprint && affected.size === 0) {
+		s.review.drift = undefined;
+		return { state: s, message: "Review snapshot is unchanged." };
+	}
+	s.review.coveredItemIds = s.review.coveredItemIds.filter((id) => !affected.has(id));
+	const uncovered = new Set([...s.review.uncoveredItemIds, ...affected]);
+	s.review.uncoveredItemIds = [...uncovered].sort();
+	s.review.drift = {
+		detectedAt: nowIso(),
+		fingerprint,
+		addedItemIds: [...new Set(addedItemIds)].sort(),
+		removedItemIds: [...new Set(removedItemIds)].sort(),
+		changedItemIds: [...new Set(changedItemIds)].sort(),
+	};
+	pushEvent(s, "review_drift", `${affected.size} review item(s) added, removed, or changed`);
+	return { state: s, message: `Review snapshot drift recorded (${affected.size} affected item(s)); affected coverage is incomplete.` };
 }
 
 /**
@@ -457,6 +580,11 @@ export function taskAccept(s: RpacState, ref: number | string, reason: string): 
 	task.status = "done";
 	task.doneAt = nowIso();
 	task.acceptedException = reason.trim();
+	if (s.review && task.reviewItemIds?.length) {
+		const uncovered = new Set(s.review.uncoveredItemIds);
+		for (const id of task.reviewItemIds) uncovered.add(id);
+		s.review.uncoveredItemIds = [...uncovered].sort();
+	}
 	task.issues = [...(task.issues ?? []), `accepted exception: ${reason.trim()}`];
 	pushEvent(s, "task_accepted", `task ${task.id} accepted with documented exception: ${reason.trim()}`);
 	addCheckpoint(s, `task ${task.id} accepted with exception: ${truncate(reason.trim(), 120)}`);
@@ -551,11 +679,22 @@ export function consolidateComplete(s: RpacState, reportPath: string, summary?: 
 	if (res === "absent") {
 		throw new RpacGuardError(`report not found at ${reportPath}. Write the completion report there first.`);
 	}
+	if (s.workflowKind === "review" && s.artifacts.report) {
+		const finalTask = [...s.tasks].reverse().find((task) => task.status === "done");
+		if (finalTask) {
+			finalTask.deliverables = [
+			...(finalTask.deliverables ?? []).filter((artifact) => artifact.path !== s.artifacts.report!.path),
+			{ ...s.artifacts.report },
+			];
+		}
+	}
 	s.phase = "done";
 	pushEvent(s, "phase", `consolidate → done${summary ? `: ${summary}` : ""}`);
 	return {
 		state: s,
-		message: "Workflow complete. Completion report written. Review it, then commit or discard at your discretion.",
+		message: s.workflowKind === "review"
+			? "Review workflow complete. Review report written; any fixes require a separate ordinary RPAC workflow."
+			: "Workflow complete. Completion report written. Review it, then commit or discard at your discretion.",
 	};
 }
 
@@ -595,6 +734,9 @@ export function abort(s: RpacState, reason?: string): MachineResult {
  */
 export function backToAct(s: RpacState, reason: string): MachineResult {
 	requirePhase(s, ["consolidate"], "back to act");
+	if (s.workflowKind === "review") {
+		throw new RpacGuardError("review workflows are report-only — record findings in review-report.md; fixes use a separate /rpac start workflow");
+	}
 	if (!reason || !reason.trim()) throw new RpacGuardError("back_to_act requires the problem found");
 	const nextId = s.tasks.reduce((m, t) => Math.max(m, t.id), 0) + 1;
 	const repair: RpacTask = { id: nextId, title: `Repair: ${truncate(reason.trim(), 80)}`, status: "pending" };

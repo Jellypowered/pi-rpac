@@ -183,7 +183,7 @@ export async function rpacTool(m: MockPi, cwd: string, params: Record<string, un
 	return res.content.map((c) => c.text).join("\n");
 }
 
-// --- repo / artifact helpers for e2e (v2 per-workflow layout) ---------------
+// --- repo / artifact helpers for e2e (versioned per-workflow layout) --------
 
 export function repoDir(root: string): void {
 	mkdirSync(root, { recursive: true });
