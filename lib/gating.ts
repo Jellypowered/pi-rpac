@@ -33,8 +33,6 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bwget\b[^|;&)]*\s-[oO]\s+(?!-)\S/,
 	/\bdd\b/,
 	/\bshred\b/,
-	/(^|[^<])>(?!>)/,
-	/>>/,
 	/\b(sed\s+(-i|--in-place)|perl\s+-i|awk\s+.*\bprint\s*>)\b/i,
 	/\bnpm\s+(install|uninstall|update|ci|link|publish|deprecate)\b/i,
 	/\byarn\s+(add|remove|install|publish|upgrade)\b/i,
@@ -44,7 +42,7 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade|full-upgrade)\b/i,
 	/\b(dnf|yum)\s+(install|remove|erase|update|upgrade)\b/i,
 	/\bbrew\s+(install|uninstall|upgrade|remove)\b/i,
-	/\bgit\s+(?:(?:add|commit|push|pull|merge|rebase|reset|checkout|switch|stash|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree)(?=\s|$)|branch\s+(?:-[dD]\b|\w))/i,
+	/\bgit\s+(?:(?:add|commit|push|pull|merge|rebase|reset|checkout|switch|stash(?!\s+list(?:\s|$))|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree)(?=\s|$)|branch\s+(?:-[dD]\b|\w))/i,
 	/\bgit\s+config\b(?!\s+--get(?:\s|$))/i,
 	/\bsudo\b/,
 	/\bsu\s+(-|\w)/,
@@ -108,11 +106,13 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*readlink\b/,
 	/^\s*xargs\s+(grep|ls|stat|file|wc|du|md5sum|sha256sum)\b/,
 	/^\s*git\s+(status|log|diff|show|rev-parse|ls-files|shortlog|describe|merge-base|for-each-ref|name-rev)(?:\s|$)/i,
+	/^\s*git\s+check-ignore(?:\s|$)/i,
+	/^\s*git\s+stash\s+list\s*$/i,
 	/^\s*git\s+remote(?:\s+-v)?\s*$/i,
 	/^\s*git\s+branch(?:\s+(?:--list|-a|--all|-r|--remotes|--show-current|-v|-vv))*\s*$/i,
 	/^\s*git\s+config\s+--get(?:\s|$)/i,
 	/^\s*git\s+ls-/i,
-	/^\s*(node|deno|bun)\s+--(version|help)\b/i,
+	/^\s*(node|deno|bun)\s+(?:-v|--(?:version|help))\s*$/i,
 	/^\s*(python[23]?|ruby|perl|java)\s+--version\b/i,
 	/^\s*docker\s+(ps|inspect|images|version)(?:\s|$)/i,
 	/^\s*md5sum\b/,
@@ -174,12 +174,50 @@ function shellSegments(command: string): string[] | null {
 	return segments;
 }
 
+/** Replace quoted/escaped text so literal `>` characters are not parsed as shell operators. */
+function shellSyntaxOnly(command: string): string | null {
+	let result = "";
+	let quote: "'" | '"' | null = null;
+	let escaped = false;
+	for (const ch of command) {
+		if (escaped) {
+			result += " ";
+			escaped = false;
+			continue;
+		}
+		if (ch === "\\" && quote !== "'") {
+			result += " ";
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			result += " ";
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			result += " ";
+			continue;
+		}
+		result += ch;
+	}
+	return quote || escaped ? null : result;
+}
+
 /** Strip harmless output redirections used to suppress inspection noise. */
 function stripSafeRedirections(command: string): string {
 	return command
-		.replace(/(?:\d+|&)?\s*>\s*\/dev\/null\b/g, "")
-		.replace(/\d*\s*>\s*&\s*\d+\b/g, "")
+		.replace(/(?:\d+|&)?\s*>\s*\/dev\/null(?=\s|$)/g, "")
+		.replace(/\d*\s*>\s*&\s*\d+(?=\s|$)/g, "")
 		.trim();
+}
+
+/** True for output redirection outside quotes, except explicit suppression to `/dev/null`/another fd. */
+function hasUnsafeOutputRedirection(command: string): boolean {
+	const syntax = shellSyntaxOnly(command);
+	if (syntax === null) return true;
+	return stripSafeRedirections(syntax).includes(">");
 }
 
 /** Normalize leading env assignments and read-only git global options. */
@@ -202,6 +240,7 @@ function hasDestructiveShellSegment(rawCommand: string): boolean {
 	const segments = shellSegments(rawCommand.trim());
 	if (!segments?.length) return true;
 	for (const seg of segments) {
+		if (hasUnsafeOutputRedirection(seg)) return true;
 		const withoutSafeRedirections = stripSafeRedirections(seg);
 		const normalized = normalize(withoutSafeRedirections);
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
@@ -211,17 +250,38 @@ function hasDestructiveShellSegment(rawCommand: string): boolean {
 	return false;
 }
 
-export function isReadOnlyCommand(rawCommand: string): boolean {
+function shortSegment(segment: string): string {
+	return segment.length > 120 ? `${segment.slice(0, 117)}…` : segment;
+}
+
+/** Explain the first fail-closed shell-policy rejection, or return null when the command is allowed. */
+function readOnlyCommandIssue(rawCommand: string): string | null {
 	const command = rawCommand.trim();
-	if (command === "") return true;
+	if (command === "") return null;
 	const segments = shellSegments(command);
-	if (!segments?.length || hasDestructiveShellSegment(command)) return false;
+	if (!segments?.length) {
+		return "unsupported shell syntax (unclosed quoting, escaping, or command/process substitution)";
+	}
 	for (const seg of segments) {
+		if (hasUnsafeOutputRedirection(seg)) {
+			return `output redirection is not read-only in segment: ${shortSegment(seg)}`;
+		}
 		const withoutSafeRedirections = stripSafeRedirections(seg);
 		const normalized = normalize(withoutSafeRedirections);
-		if (!SAFE_PATTERNS.some((p) => p.test(normalized))) return false;
+		for (const pattern of DESTRUCTIVE_PATTERNS) {
+			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) {
+				return `a blocked mutating operation appears in segment: ${shortSegment(seg)}`;
+			}
+		}
+		if (!SAFE_PATTERNS.some((pattern) => pattern.test(normalized))) {
+			return `command segment is not on the read-only allowlist: ${shortSegment(seg)}`;
+		}
 	}
-	return true;
+	return null;
+}
+
+export function isReadOnlyCommand(rawCommand: string): boolean {
+	return readOnlyCommandIssue(rawCommand) === null;
 }
 
 /** Exact user-approved review checks may exceed the inspection allowlist, but never the destructive denylist. */
@@ -293,14 +353,17 @@ export function gateToolCall(
 
 	if (toolName === "bash" || toolName === "powershell") {
 		const command = typeof input?.command === "string" ? input.command : undefined;
-		if (command !== undefined && !isReadOnlyCommand(command)) {
-			return {
-				block: true,
-				reason:
-					`RPAC ${phase} phase restricts the shell to read-only commands (no file/package/git mutations). ` +
-					`Blocked: ${command.length > 160 ? command.slice(0, 157) + "…" : command}. ` +
-					`Use read-only inspection (grep/find/git status/git diff/…) instead.`,
-			};
+		if (command !== undefined) {
+			const issue = readOnlyCommandIssue(command);
+			if (issue) {
+				return {
+					block: true,
+					reason:
+						`RPAC ${phase} phase restricts the shell to read-only commands (no file/package/git mutations). ` +
+						`Rejected because ${issue}. Use direct read or an allowlisted inspection command ` +
+						`(grep/find/git status/git diff); every segment of a compound command must qualify.`,
+				};
+			}
 		}
 		return null;
 	}
@@ -349,11 +412,13 @@ function gateReviewToolCall(
 		const command = typeof input?.command === "string" ? input.command : undefined;
 		if (command === undefined || isReadOnlyCommand(command) ||
 			((state.phase === "act" || state.phase === "consolidate") && isApprovedReviewCheck(state, command))) return null;
+		const issue = readOnlyCommandIssue(command);
 		return {
 			block: true,
 			reason:
 				`RPAC ${phase} permits read-only inspection and exact non-destructive checks from the approved review plan. ` +
-				`Blocked unapproved or mutating command: ${command.length > 160 ? command.slice(0, 157) + "…" : command}`,
+				`Rejected because ${issue ?? "the command does not exactly match an approved review check"}. ` +
+				"Run approved checks exactly as recorded; prefixes, suffixes, and pipelines change the command.",
 		};
 	}
 	if (toolName === "rpac" || READ_ONLY_TOOLS.has(toolName)) return null;

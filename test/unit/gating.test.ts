@@ -159,13 +159,19 @@ const SAFE: [string, string][] = [
 	["git branch list all", "git branch -a"],
 	["git branch verbose", "git branch -vv"],
 	["git config read", "git config --get remote.origin.url"],
+	["git check-ignore", "git check-ignore renderer/styles/output.css"],
+	["git stash list", "git -C /work/proj stash list"],
 	["quoted grep alternation", "grep -rn \"one\\|two\" src"],
+	["quoted append operators", "grep -rn \"guid <<\\|guid >>\\|guid &\\|& 0x\" src"],
+	["single-quoted redirection text", "grep 'literal > and >> text' src/app.ts"],
+	["escaped redirection text", "printf \\>"],
 	["stderr to dev null", "find . -name '*.ts' 2>/dev/null"],
 	["fd redirection", "git show HEAD 2>&1 | head"],
 	["change directory", "cd /work/proj && git status"],
 	["piped reads", "ls | grep foo | wc -l"],
 	["compound reads", "git status && git diff"],
 	["node --version", "node --version"],
+	["node -v", "node -v"],
 	["printenv", "printenv PATH"],
 ];
 
@@ -175,10 +181,20 @@ const BLOCKED: [string, string][] = [
 	["git push", "git push origin main"],
 	["git checkout", "git checkout main"],
 	["git cwd checkout", "git -C /work/proj checkout main"],
+	["git stash push", "git stash push -m save"],
+	["git stash pop", "git stash pop"],
+	["git stash drop", "git stash drop stash@{0}"],
+	["git stash clear", "git stash clear"],
+	["git stash list options stay fail-closed", "git stash list --format=%gd"],
 	["git config write", "git config user.name attacker"],
 	["redirect", "echo hi > out.txt"],
+	["redirect after quoted text", "grep 'literal > text' file > out.txt"],
 	["redirect under tmp", "ls > /tmp/out.txt"],
+	["dev-null prefix is not suppression", "ls > /dev/null.log"],
+	["dev-null traversal is not suppression", "ls > /dev/null/../output"],
 	["append redirect", "echo hi >> log.txt"],
+	["stderr redirect to file", "grep foo file 2>/tmp/errors"],
+	["combined redirect to file", "grep foo file &>output.txt"],
 	["rm", "rm -rf build"],
 	["mv", "mv a b"],
 	["cp", "cp a b"],
@@ -189,6 +205,8 @@ const BLOCKED: [string, string][] = [
 	["pip install", "pip install requests"],
 	["sudo", "sudo apt-get update"],
 	["unknown command (fail-closed)", "frobnicate --all"],
+	["node eval stays blocked", "node -e 'console.log(1)'"],
+	["node version with extra args", "node -v -e 'console.log(1)'"],
 	["node mutating", "node -e 'require(\"fs\").writeFileSync(\"x\",\"y\")'"],
 	["pipe to tee", "cat a | tee b"],
 	["curl -o", "curl -o out.html https://x"],
@@ -227,6 +245,30 @@ test("gate blocks mutating bash in refine/plan and allows read-only bash", () =>
 	assert.equal(gateToolCall(s, ROOT, "bash", { command: "git status" }, ROOT), null);
 	const s2 = state("plan");
 	assert.ok(gateToolCall(s2, ROOT, "bash", { command: "echo hi > out.txt" }, ROOT)?.block);
+});
+
+test("shell denials identify the first rejected segment and rejection class", () => {
+	const s = state("refine");
+	const unknown = gateToolCall(s, ROOT, "bash", { command: "git status && rg -n todo src" }, ROOT);
+	assert.match(unknown!.reason, /not on the read-only allowlist: rg -n todo src/);
+	assert.match(unknown!.reason, /every segment of a compound command must qualify/);
+
+	const redirected = gateToolCall(s, ROOT, "bash", { command: "grep todo src > findings.txt" }, ROOT);
+	assert.match(redirected!.reason, /output redirection is not read-only/);
+
+	const mutation = gateToolCall(s, ROOT, "bash", { command: "git status && git push" }, ROOT);
+	assert.match(mutation!.reason, /blocked mutating operation.*git push/);
+
+	const substitution = gateToolCall(s, ROOT, "bash", { command: "echo \"$(touch marker)\"" }, ROOT);
+	assert.match(substitution!.reason, /unsupported shell syntax/);
+});
+
+test("review denial explains exact approved-check matching", () => {
+	const act = reviewState("act");
+	const decision = gateToolCall(act, ROOT, "bash", { command: "cd /work/proj && npm test" }, ROOT);
+	assert.ok(decision?.block);
+	assert.match(decision.reason, /not on the read-only allowlist: npm test/);
+	assert.match(decision.reason, /Run approved checks exactly as recorded/);
 });
 
 // --- path resolution helpers --------------------------------------------------
