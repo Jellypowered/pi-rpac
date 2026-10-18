@@ -17,6 +17,9 @@ import type { RpacState } from "./schema.ts";
 import { artifactFile, reviewBatchFile, reviewReportFile } from "./paths.ts";
 
 const DESTRUCTIVE_PATTERNS: RegExp[] = [
+	// GitHub access for PR reviews is owned by the native preparation/drift path.
+	// Approval of a project check never grants permission to publish a PR action.
+	/\bgh\b/i,
 	/\brm\b/,
 	/\brmdir\b/,
 	/\bmv\b/,
@@ -42,7 +45,7 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade|full-upgrade)\b/i,
 	/\b(dnf|yum)\s+(install|remove|erase|update|upgrade)\b/i,
 	/\bbrew\s+(install|uninstall|upgrade|remove)\b/i,
-	/\bgit\s+(?:(?:add|commit|push|pull|merge|rebase|reset|checkout|switch|stash(?!\s+list(?:\s|$))|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree)(?=\s|$)|branch\s+(?:-[dD]\b|\w))/i,
+	/\bgit\s+(?:(?:add|commit|push|pull|merge|rebase|reset|checkout|switch|stash(?!\s+list(?:\s|$))|cherry-pick|revert|tag|init|clone|am|apply|restore|clean|rm|mv|worktree|fetch|update-ref|update-index|read-tree|checkout-index|symbolic-ref|pack-refs|gc)(?=\s|$)|branch\s+(?:-[dD]\b|\w))/i,
 	/\bgit\s+config\b(?!\s+--get(?:\s|$))/i,
 	/\bsudo\b/,
 	/\bsu\s+(-|\w)/,
@@ -243,6 +246,10 @@ function hasDestructiveShellSegment(rawCommand: string): boolean {
 		if (hasUnsafeOutputRedirection(seg)) return true;
 		const withoutSafeRedirections = stripSafeRedirections(seg);
 		const normalized = normalize(withoutSafeRedirections);
+		// Unknown Git global options must not hide mutations from the denylist
+		// (e.g. git --git-dir=... update-ref). Only known read-only Git syntax
+		// may appear directly in an approved project check.
+		if (/^(?:env\s+(?:[A-Z_][A-Z0-9_]*=\S*\s+)*)?git(?:\s|$)/i.test(normalized) && readOnlyCommandIssue(seg) !== null) return true;
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
 			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) return true;
 		}
@@ -284,11 +291,27 @@ export function isReadOnlyCommand(rawCommand: string): boolean {
 	return readOnlyCommandIssue(rawCommand) === null;
 }
 
+/** Canonical POSIX prefix: the directory is part of the exact approved command. */
+export function prCheckPrefix(location: string): string {
+	return `cd -- '${location.replaceAll("'", "'\\''")}' && `;
+}
+
+/** A PR check must start in its pinned checkout, not the Pi session's cwd. */
+export function hasPrCheckDirectory(state: RpacState, command: string): boolean {
+	if (!state.review?.pr) return true;
+	const prefix = prCheckPrefix(state.review.pr.checkoutLocation);
+	if (!command.trim().startsWith(prefix)) return false;
+	const rest = shellSegments(command.trim().slice(prefix.length));
+	// No subsequent shell directory switches. Approved scripts remain trusted code,
+	// not an OS sandbox; approval must account for what those scripts execute.
+	return rest !== null && rest.length > 0 && !rest.some(s => /^cd(?:\s|$)/.test(normalize(s)));
+}
+
 /** Exact user-approved review checks may exceed the inspection allowlist, but never the destructive denylist. */
 export function isApprovedReviewCheck(state: RpacState, rawCommand: string): boolean {
 	if (state.workflowKind !== "review" || !state.review || !state.approvals.plan) return false;
 	const command = rawCommand.trim();
-	return state.review.approvedChecks.includes(command) && !hasDestructiveShellSegment(command);
+	return state.review.approvedChecks.includes(command) && hasPrCheckDirectory(state, command) && !hasDestructiveShellSegment(command);
 }
 
 /** The single workflow artifact the model may write in the given phase. */
@@ -410,6 +433,10 @@ function gateReviewToolCall(
 	}
 	if (toolName === "bash" || toolName === "powershell") {
 		const command = typeof input?.command === "string" ? input.command : undefined;
+		if (command !== undefined && state.review?.pr && state.review.approvedChecks.includes(command.trim()) &&
+			(toolName !== "bash" || !hasPrCheckDirectory(state, command))) {
+			return { block: true, reason: `PR verification requires bash and the exact approved checkout prefix: ${prCheckPrefix(state.review.pr.checkoutLocation)}. Replan old checks without this prefix.` };
+		}
 		if (command === undefined || isReadOnlyCommand(command) ||
 			((state.phase === "act" || state.phase === "consolidate") && isApprovedReviewCheck(state, command))) return null;
 		const issue = readOnlyCommandIssue(command);

@@ -1,7 +1,7 @@
 // RPAC GitHub PR review — metadata resolution, safe checkout, and the
 // object-level base...head snapshot that scopes a PR review.
 //
-// Design (see DESIGN.md §2.8):
+// Design (see DESIGN.md §2.2b):
 //   * The *scope* of a PR review is the deterministic, object-level diff
 //     `base...head` (three dots = merge-base, matching GitHub's PR view). It is
 //     computed straight from Git objects and is independent of the working
@@ -20,8 +20,8 @@
 //
 // All Git I/O uses argument arrays (no shell); `gh` is invoked as a program.
 import { execFileSync } from "node:child_process";
-import { basename, dirname, join } from "node:path";
-import { existsSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import type { PrReviewMeta } from "./schema.ts";
 import {
 	type ReviewExclusion,
@@ -35,7 +35,9 @@ import {
 	itemId,
 	sha256,
 	canonicalJson,
-	LARGE_FILE_BYTES,
+	parseLsTree,
+	blobLayer,
+	isInternalRpacPath,
 } from "./review.ts";
 import { nowIso } from "./util.ts";
 import { gitInfo } from "./git.ts";
@@ -122,7 +124,7 @@ export const defaultGhRunner: GhRunner = {
 		}
 	},
 	prCheckout(root, number) {
-		const res = runGh(["pr", "checkout", String(number)], root);
+		const res = runGh(["pr", "checkout", String(number), "--detach"], root);
 		if (!res.ok) {
 			throw new Error(`gh pr checkout ${number} failed: ${res.err}`);
 		}
@@ -136,8 +138,12 @@ export const defaultGhRunner: GhRunner = {
 
 /** "owner/name" from a GitHub PR/repo URL. */
 export function repositoryFromUrl(url: string): string {
-	const m = url.match(/github\.com\/([^/\s]+)\/([^/\s#?]+)/i);
-	return m ? `${m[1]}/${m[2]}` : "";
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) return "";
+		const m = parsed.pathname.match(/^\/([\w.-]+)\/([\w.-]+)(?:\/pull\/[1-9]\d*)?\/?$/);
+		return m ? `${m[1]}/${m[2]}` : "";
+	} catch { return ""; }
 }
 
 export type PrState = "open" | "closed" | "merged";
@@ -166,14 +172,23 @@ export interface ResolvedPr {
 }
 
 /** Convert raw gh output into the normalized PR identity. Throws on bad refs. */
-export function resolvePrMeta(view: PrViewResult): ResolvedPr {
+export function resolvePrMeta(view: PrViewResult, expectedNumber?: number): ResolvedPr {
+	if (!view || !Number.isSafeInteger(view.number) || view.number < 1 ||
+		(expectedNumber !== undefined && view.number !== expectedNumber)) throw new Error("PR metadata has an invalid or mismatched PR number");
+	if (typeof view.url !== "string" || !view.url.endsWith(`/pull/${view.number}`) ||
+		!repositoryFromUrl(view.url)) throw new Error("PR metadata has an invalid PR URL/repository");
+	if (!["OPEN", "CLOSED", "MERGED"].includes(view.state)) throw new Error("PR metadata has an invalid state");
+	for (const key of ["title", "body", "baseRefName", "headRefName"] as const) {
+		if (typeof view[key] !== "string") throw new Error(`PR metadata has invalid ${key}`);
+	}
+	if (!view.baseRefName || !view.headRefName || view.baseRefName.startsWith("-") || view.headRefName.startsWith("-")) {
+		throw new Error("PR metadata has invalid refs");
+	}
 	const shaOk = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{40}$/.test(v);
 	if (typeof view.baseRefOid !== "string" || !shaOk(view.baseRefOid) || typeof view.headRefOid !== "string" || !shaOk(view.headRefOid)) {
 		throw new Error("PR metadata is missing a valid base/head commit SHA — the PR references may be unavailable");
 	}
-	const repository = repositoryFromUrl(view.url)
-		|| view.headRepository?.nameWithOwner
-		|| "";
+	const repository = repositoryFromUrl(view.url);
 	if (!repository) {
 		throw new Error("could not determine the PR repository from its URL");
 	}
@@ -208,6 +223,24 @@ export interface CheckoutAssessment {
 	dirty: string[];
 }
 
+/** Select the PR BASE repository remote, not an arbitrary origin (which may be a fork). */
+export function selectPrRemote(root: string, pr: ResolvedPr): string {
+	const host = new URL(pr.url).host.toLowerCase();
+	for (const name of runGitText(root, ["remote"]).split("\n")) {
+		// Read configured URLs before insteadOf expansion; Git applies that expansion at fetch time.
+		const url = runGitText(root, ["config", "--get", `remote.${name}.url`]);
+		const scp = url.match(/^(?:[^@/]+@)?([^:/]+):(.+)$/);
+		let remoteHost: string; let path: string;
+		if (scp && !url.includes("://")) { remoteHost = scp[1]!; path = scp[2]!; }
+		else {
+			try { const parsed = new URL(url); remoteHost = parsed.host; path = parsed.pathname.slice(1); }
+			catch { continue; }
+		}
+		if (remoteHost.toLowerCase() === host && path.replace(/\.git$/, "").toLowerCase() === pr.repository.toLowerCase()) return name;
+	}
+	throw new Error(`no remote matches the PR base repository ${host}/${pr.repository}`);
+}
+
 /** Inspect the repository to decide whether a PR checkout is safe. */
 export function assessPrCheckout(root: string): CheckoutAssessment {
 	const info = gitInfo(root);
@@ -218,7 +251,10 @@ export function assessPrCheckout(root: string): CheckoutAssessment {
 		isRepo: info.isRepo,
 		hasRemote: remoteNames.length > 0,
 		remote,
-		clean: info.dirty.length === 0,
+		// Status errors must throw, never masquerade as a clean tree. Ignored files
+		// are local work too: checkout can otherwise overwrite them.
+		clean: !hasHiddenIndexEntries(root) && splitNul(runGitBuffer(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"]))
+			.every(record => isInternalRpacPath(record.subarray(3))),
 		dirty: info.dirty,
 	};
 }
@@ -233,6 +269,8 @@ export interface PrReviewSnapshot {
 	root: string;
 	prNumber: number;
 	baseSha: string;
+	/** Actual left side of the three-dot PR diff. */
+	mergeBaseSha: string;
 	headSha: string;
 	capturedAt: string;
 	fingerprintAlgorithm: "sha256";
@@ -272,33 +310,6 @@ export function parseNameStatus(data: Buffer): NameStatusRecord[] {
 	return records;
 }
 
-/** OID of `commit:path` or null when the object is absent (added/deleted side). */
-function objectShaAt(root: string, commit: string, pathDisplay: string): string | null {
-	if (!pathDisplay) return null;
-	const oid = runGitText(root, ["rev-parse", "--verify", `${commit}:${pathDisplay}`], true);
-	return oid || null;
-}
-
-function prObjectLayer(
-	root: string,
-	oid: string,
-	source: "base" | "pr",
-	cache: Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>,
-): ReviewLayer {
-	let blob = cache.get(oid);
-	if (!blob) {
-		const bytes = runGitBuffer(root, ["cat-file", "blob", oid]);
-		blob = {
-			sha256: sha256(bytes),
-			size: bytes.length,
-			binary: bytes.subarray(0, Math.min(bytes.length, 8192)).includes(0),
-			large: bytes.length > LARGE_FILE_BYTES,
-		};
-		cache.set(oid, blob);
-	}
-	return { source, state: "present", objectId: oid, ...blob };
-}
-
 function changeKind(status: string): string {
 	const h = status[0];
 	if (h === "A") return "added";
@@ -327,7 +338,14 @@ export function capturePrSnapshot(
 			throw new Error(`git object ${sha.slice(0, 12)} is not available locally — fetch the PR refs (git fetch origin refs/pull/${prNumber}/head) first`);
 		}
 	}
-	const data = runGitBuffer(resolvedRoot, ["diff", "--name-status", "--find-renames", "-z", `${baseSha}...${headSha}`]);
+	// Three-dot scope and base content must use the SAME merge base. Fail closed
+	// on ambiguous criss-cross histories rather than choosing an arbitrary ancestor.
+	const ancestors = runGitText(resolvedRoot, ["merge-base", "--all", baseSha, headSha]).split("\n");
+	if (ancestors.length !== 1) throw new Error("PR diff requires a unique merge base");
+	const mergeBaseSha = ancestors[0]!;
+	const baseTree = parseLsTree(runGitBuffer(resolvedRoot, ["ls-tree", "-rz", "--full-tree", mergeBaseSha]));
+	const headTree = parseLsTree(runGitBuffer(resolvedRoot, ["ls-tree", "-rz", "--full-tree", headSha]));
+	const data = runGitBuffer(resolvedRoot, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", "-z", mergeBaseSha, headSha]);
 	const records = parseNameStatus(data);
 	const exclusionSet = new Set(exclusions.map((e) => e.path));
 	const blobCache = new Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>();
@@ -336,13 +354,12 @@ export function capturePrSnapshot(
 	for (const rec of ordered) {
 		const key = pathKey(rec.path);
 		const path = displayPath(rec.path);
-		if (exclusionSet.has(path)) continue;
+		if (isInternalRpacPath(rec.path) || exclusionSet.has(path)) continue;
 		const basePath = rec.originalPath ?? rec.path;
-		const baseOid = objectShaAt(resolvedRoot, baseSha, displayPath(basePath));
-		const headOid = objectShaAt(resolvedRoot, headSha, path);
+		// Raw path bytes are authoritative; never resolve commit:path via UTF-8.
 		const layers: ReviewLayer[] = [
-			baseOid ? prObjectLayer(resolvedRoot, baseOid, "base", blobCache) : { source: "base", state: "deleted" },
-			headOid ? prObjectLayer(resolvedRoot, headOid, "pr", blobCache) : { source: "pr", state: "deleted" },
+			blobLayer(resolvedRoot, baseTree.get(pathKey(basePath)), "base", blobCache),
+			blobLayer(resolvedRoot, headTree.get(key), "pr", blobCache),
 		];
 		items.push({
 			id: itemId(rec.path),
@@ -360,6 +377,7 @@ export function capturePrSnapshot(
 		mode: "pr",
 		prNumber,
 		baseSha,
+		mergeBaseSha,
 		headSha,
 		items: items.map(({ id: _id, path: _path, originalPath: _op, ...identity }) => identity),
 		exclusions: sortedExclusions,
@@ -370,6 +388,7 @@ export function capturePrSnapshot(
 		root: resolvedRoot,
 		prNumber,
 		baseSha,
+		mergeBaseSha,
 		headSha,
 		capturedAt: nowIso(),
 		fingerprintAlgorithm: "sha256",
@@ -391,6 +410,12 @@ export function verifyGitObjects(root: string, shas: string[]): boolean {
 // ---------------------------------------------------------------------------
 // Checkout execution
 // ---------------------------------------------------------------------------
+
+/** Non-forcing, shell-quoted restoration hint, including originally detached HEADs. */
+export function prRestoreCommand(pr: Pick<PrReviewMeta, "originalBranch" | "originalHead">): string {
+	const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+	return pr.originalBranch ? `git switch -- ${quote(pr.originalBranch)}` : `git switch --detach ${quote(pr.originalHead)}`;
+}
 
 /** Deterministic sibling location for an isolated PR worktree. */
 export function prWorktreePath(root: string, number: number): string {
@@ -419,29 +444,38 @@ export function performPrCheckout(
 	remote: string = "origin",
 ): PrCheckoutOutcome {
 	if (strategy === "in-place") {
-		const output = gh.prCheckout(root, meta.number);
-		const head = runGitText(root, ["rev-parse", "HEAD"]);
-		if (head !== meta.headSha) {
-			throw new Error(`in-place checkout did not land on the PR head (${head.slice(0, 12)} ≠ ${meta.headSha.slice(0, 12)})`);
+		assertCleanCheckout(root, true);
+		const original = gitInfo(root);
+		try {
+			const output = gh.prCheckout(root, meta.number);
+			const head = runGitText(root, ["rev-parse", "HEAD"]);
+			if (head !== meta.headSha) throw new Error(`in-place checkout did not land on the PR head (${head.slice(0, 12)} ≠ ${meta.headSha.slice(0, 12)})`);
+			// Also enforce detached checkout for injected runners and older gh versions.
+			runGitText(root, ["checkout", "--detach", meta.headSha]);
+			return { strategy, location: root, head, output };
+		} catch (err) {
+			// Never reset/force over work created during a failed checkout.
+			try {
+				assertCleanCheckout(root, true);
+				if (original.branch && runGitText(root, ["rev-parse", original.branch]) !== original.head) throw new Error("original branch moved");
+				runGitText(root, ["checkout", original.branch || original.head]);
+			} catch {
+				throw new Error(`${(err as Error).message}; could not safely restore checkout — original branch ${original.branch || "(detached)"}, HEAD ${original.head}. Preserve local changes and restore manually.`);
+			}
+			throw err;
 		}
-		return { strategy, location: root, head, output };
 	}
 
 	// worktree strategy
 	const location = prWorktreePath(root, meta.number);
-	if (existsSync(location)) {
-		// Reuse an existing worktree only if it already points at the head.
-		const existingHead = runGitText(location, ["rev-parse", "HEAD"], true);
-		if (existingHead !== meta.headSha) {
-			throw new Error(
-				`a directory already exists at the PR worktree location ${location} and does not match the PR head — remove it manually and retry`,
-			);
-		}
+	if (existsSync(location) || isSymlink(location)) {
+		assertOwnedPrWorktree(root, meta.number, meta.headSha);
+		assertCleanCheckout(location);
 	} else {
 		const ref = `refs/rpac/pr/${meta.number}`;
 		// Fetch the PR head ref itself into a local ref. Do NOT fetch the remote's HEAD:
 		// GitHub's HEAD is the default branch, not the PR head.
-		const fetched = runGitText(root, ["fetch", remote, `+refs/pull/${meta.number}/head:${ref}`], true);
+		const fetched = runGitText(root, ["fetch", remote, `+refs/pull/${meta.number}/head:${ref}`]);
 		const fetchedOk = runGitText(root, ["rev-parse", "--verify", ref], true);
 		if (!fetchedOk || fetchedOk !== meta.headSha) {
 			throw new Error(
@@ -449,24 +483,81 @@ export function performPrCheckout(
 				`verify the remote points at ${meta.repository} and the PR refs are reachable`,
 			);
 		}
-		const added = runGitText(root, ["worktree", "add", "--detach", location, ref], true);
+		const added = runGitText(root, ["worktree", "add", "--detach", location, ref]);
 		const head = runGitText(location, ["rev-parse", "HEAD"], true);
 		if (!head || head !== meta.headSha) {
 			throw new Error(`worktree checkout failed${added ? `: ${added}` : ""} (expected head ${meta.headSha.slice(0, 12)})`);
 		}
+		// Ownership is recorded in Git's administrative dir, never in reviewed files.
+		writeFileSync(ownerFile(location), JSON.stringify({ root: realpathSync(root), number: meta.number, head }), { flag: "wx" });
 		return { strategy, location, head, output: added };
 	}
 	return { strategy, location, head: runGitText(location, ["rev-parse", "HEAD"]), output: "reused existing worktree" };
 }
 
-/** Remove an isolated PR worktree (safe cleanup; refuses in-place location). */
-export function removePrWorktree(root: string, number: number): string {
+function isSymlink(path: string): boolean {
+	try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
+}
+
+function ownerFile(location: string): string {
+	return join(runGitText(location, ["rev-parse", "--absolute-git-dir"]), "rpac-pr-owner.json");
+}
+
+/** Validate exact registered location, common repository, and RPAC ownership. */
+export function assertOwnedPrWorktree(root: string, number: number, expectedHead?: string): void {
 	const location = prWorktreePath(root, number);
-	if (!existsSync(location)) return "no worktree to remove";
-	runGitText(root, ["worktree", "remove", "--force", location], true);
-	if (existsSync(location)) rmSync(location, { recursive: true, force: true });
-	runGitText(root, ["worktree", "prune"], true);
+	if (isSymlink(location) || !existsSync(location) || realpathSync(location) !== resolve(location)) {
+		throw new Error("PR worktree ownership check failed: missing or symlinked location");
+	}
+	const records = splitNul(runGitBuffer(root, ["worktree", "list", "--porcelain", "-z"]));
+	if (!records.some(r => r.equals(Buffer.from(`worktree ${location}`)))) {
+		throw new Error("PR location is not a registered worktree of this repository");
+	}
+	const common = (path: string) => realpathSync(runGitText(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
+	if (common(root) !== common(location)) throw new Error("PR worktree belongs to a different repository");
+	let owner: { root?: string; number?: number; head?: string };
+	try { owner = JSON.parse(readFileSync(ownerFile(location), "utf8")); }
+	catch { throw new Error("PR worktree is not RPAC-owned (missing ownership record)"); }
+	if (owner.root !== realpathSync(root) || owner.number !== number || !owner.head ||
+		(expectedHead && owner.head !== expectedHead)) throw new Error("PR worktree ownership record does not match this review");
+	if (runGitText(location, ["rev-parse", "HEAD"]) !== owner.head) throw new Error("PR worktree HEAD changed; refusing cleanup/reuse");
+}
+
+/** Status can hide local modifications behind assume-unchanged/skip-worktree. */
+function hasHiddenIndexEntries(location: string): boolean {
+	return splitNul(runGitBuffer(location, ["ls-files", "-v", "-z"]))
+		.some(record => record[0] === 0x53 || (record[0]! >= 0x61 && record[0]! <= 0x7a));
+}
+
+/** Includes ignored files: Git otherwise discards them during worktree removal. */
+function assertCleanCheckout(location: string, allowRpacState = false): void {
+	if (hasHiddenIndexEntries(location)) throw new Error("PR worktree index hides potentially dirty files (assume-unchanged/skip-worktree); refusing cleanup/reuse");
+	const status = splitNul(runGitBuffer(location, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"]));
+	if (status.some(record => !allowRpacState || !isInternalRpacPath(record.subarray(3)))) {
+		throw new Error("PR worktree has dirty/uncommitted, untracked, or ignored files; preserve them before cleanup/reuse");
+	}
+}
+
+/** No force, no filesystem fallback, and no pruning unrelated worktrees. */
+export function removePrWorktree(root: string, number: number, expectedHead?: string): string {
+	const location = prWorktreePath(root, number);
+	if (!existsSync(location) && !isSymlink(location)) return "no worktree to remove";
+	assertOwnedPrWorktree(root, number, expectedHead);
+	assertCleanCheckout(location);
+	runGitText(root, ["worktree", "remove", location]);
 	return `removed PR worktree at ${location}`;
+}
+
+/** Verify that build/test evidence would come from the pinned, uncontaminated checkout. */
+export function assertPrCheckout(root: string, pr: PrReviewMeta): void {
+	if (pr.checkoutStrategy === "worktree") {
+		if (pr.checkoutLocation !== prWorktreePath(root, pr.number)) throw new Error("PR checkout location does not match its owned worktree");
+		assertOwnedPrWorktree(root, pr.number, pr.headSha);
+	} else if (resolve(pr.checkoutLocation) !== resolve(root)) throw new Error("PR in-place checkout location is invalid");
+	if (runGitText(pr.checkoutLocation, ["rev-parse", "HEAD"]) !== pr.headSha) throw new Error("PR checkout HEAD differs from the reviewed commit");
+	if (hasHiddenIndexEntries(pr.checkoutLocation)) throw new Error("PR checkout index hides potential local changes; verification evidence is untrusted");
+	const status = splitNul(runGitBuffer(pr.checkoutLocation, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]));
+	if (status.some(r => !isInternalRpacPath(r.subarray(3)))) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
 }
 
 /** Re-resolve the current PR head SHA (for force-push / drift detection). */

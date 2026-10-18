@@ -88,8 +88,10 @@ import {
 	defaultGhRunner,
 	performPrCheckout,
 	prWorktreePath,
+	prRestoreCommand,
 	removePrWorktree,
-	resolvePrHeadSha,
+	selectPrRemote,
+	assertPrCheckout,
 	resolvePrMeta,
 	verifyGitObjects,
 	type GhRunner,
@@ -105,7 +107,7 @@ import {
 	reviewReportFile,
 	workflowDir,
 } from "../lib/paths.ts";
-import { gateToolCall, gateUnreadableState } from "../lib/gating.ts";
+import { gateToolCall, gateUnreadableState, hasPrCheckDirectory, isApprovedReviewCheck, prCheckPrefix } from "../lib/gating.ts";
 import { atomicWriteFile, nowIso, projectRoot, sha256File } from "../lib/util.ts";
 import {
 	actDirective,
@@ -266,9 +268,9 @@ function statusReport(root: string): string {
 			lines.push(`PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}`);
 			if (state.phase !== "done" && state.phase !== "aborted") {
 				if (pr.checkoutStrategy === "in-place") {
-					lines.push(`PR restore: to return to the pre-review branch run \`git checkout ${pr.originalBranch || "(detached)"}\` (original HEAD ${pr.originalHead.slice(0, 8)}). RPAC never auto-restores (it could overwrite new work).`);
+					lines.push(`PR restore: to return to the pre-review branch run \`${prRestoreCommand(pr)}\` (original HEAD ${pr.originalHead.slice(0, 8)}). RPAC never auto-restores (it could overwrite new work).`);
 				} else {
-					lines.push(`PR cleanup: remove the isolated worktree with \`/rpac pr-cleanup\` (or \`git worktree remove --force ${prWorktreePath(root, pr.number)}\`). The main worktree was not touched.`);
+					lines.push(`PR cleanup: remove the isolated worktree with \`/rpac pr-cleanup\` (refuses dirty, unowned, or changed worktrees). The main worktree was not touched.`);
 				}
 			}
 		}
@@ -396,17 +398,25 @@ function recheckPrSnapshot(root: string, state: RpacState, gh: GhRunner): string
 		removed = [...state.review!.scopeItemIds];
 		note = ` recorded scope is no longer reproducible (${(err as Error).message})`;
 	}
-	// Force-push detection via the live PR head.
+	// Check BOTH PR refs and repository identity (a base retarget changes scope).
 	try {
-		const currentHead = resolvePrHeadSha(gh, root, pr.number);
-		if (currentHead !== pr.headSha) {
-			added = [];
-			changed = [];
-			removed = [...state.review!.scopeItemIds];
-			note = ` PR #${pr.number} head changed (force-pushed) ${pr.headSha.slice(0, 12)} → ${currentHead.slice(0, 12)} — review evidence is stale; re-review the new head`;
+		const live = resolvePrMeta(gh.prView(root, pr.number), pr.number);
+		if (live.url !== pr.url || live.repository !== pr.repository || live.headSha !== pr.headSha ||
+			live.baseSha !== pr.baseSha || live.baseRef !== pr.baseRef) {
+			note += ` PR #${pr.number} base/head or identity changed (possibly force-pushed/retargeted) — review evidence is stale; start a new review`;
 		}
 	} catch (err) {
-		if (!note) note = ` (could not re-resolve the PR head: ${(err as Error).message})`;
+		note += ` could not re-resolve the PR identity/base/head: ${(err as Error).message}; freshness is unverified`;
+	}
+	try { assertPrCheckout(root, pr); }
+	catch (err) { note += ` checkout verification failed: ${(err as Error).message}`; }
+	if (note) {
+		added = [];
+		changed = [...state.review!.scopeItemIds];
+		removed = [];
+		// Also preserve drift for EMPTY scopes; a matching old object fingerprint
+		// must not erase a remote/checkout verification failure.
+		fingerprint = sha256Text(`${fingerprint}\n${note}`);
 	}
 	return updateActive(root, (current) => {
 		if (current.id !== state.id) throw new RpacGuardError("active workflow changed during PR drift check");
@@ -443,8 +453,8 @@ function captureAndReplaceReviewScope(root: string, state: RpacState, exclusions
 		const pr = state.review.pr!;
 		const rawSnapshot = captureStablePrSnapshot(root, pr, []);
 		for (const exclusion of exclusions) {
-			if (!rawSnapshot.items.some((item) => item.path === exclusion.path)) {
-				throw new RpacGuardError(`review exclusion is not an exact in-scope path: ${exclusion.path}`);
+			if (rawSnapshot.items.filter((item) => item.path === exclusion.path).length !== 1) {
+				throw new RpacGuardError(`review exclusion is not a unique exact in-scope path (raw filenames may collide in display): ${exclusion.path}`);
 			}
 		}
 		const snapshot = exclusions.length > 0 ? captureStablePrSnapshot(root, pr, exclusions) : rawSnapshot;
@@ -807,7 +817,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		// PR preview subcommand: /rpac start preview <pr-number> [--yes]
 		if (tokens[0]?.toLowerCase() === "preview") {
 			const { flags, rest } = parseFlags(tokens.slice(1));
-			if (rest.trim().includes(" ")) {
+			if (rest.trim().includes(" ") || [...flags].some(flag => flag !== "yes")) {
 				ctx.ui.notify("Usage: /rpac start preview <pr-number>  (a single positive integer)", "error");
 				return;
 			}
@@ -877,7 +887,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		try {
 			// Validate the PR number (positive integer only).
 			const arg = prNumberArg.trim();
-			if (!/^\d+$/.test(arg) || Number(arg) < 1) {
+			if (!/^\d+$/.test(arg) || !Number.isSafeInteger(Number(arg)) || Number(arg) < 1) {
 				throw new RpacGuardError(`invalid PR number "${prNumberArg}" — it must be a positive integer`);
 			}
 			const prNumber = Number(arg);
@@ -921,21 +931,21 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			if (!assessment.hasRemote || !assessment.remote) {
 				throw new RpacGuardError("PR review requires a Git remote to fetch the PR refs — add one (e.g. \`git remote add origin <url>\`) and retry");
 			}
-			const remote = assessment.remote;
 
 			// Resolve PR metadata (base/head, state, url, title, body).
 			let resolved: ResolvedPr;
 			try {
-				resolved = resolvePrMeta(gh.prView(root, prNumber));
+				resolved = resolvePrMeta(gh.prView(root, prNumber), prNumber);
 			} catch (err) {
 				throw new RpacGuardError(`could not resolve PR #${prNumber}: ${(err as Error).message}`);
 			}
+			const remote = selectPrRemote(root, resolved);
 			const stateNote = resolved.state === "open" ? "" : ` · PR state: ${resolved.state}`;
 
 			// Choose the checkout strategy: in-place when the tree is clean, isolated
 			// worktree when it is not (never discard local work).
-			const strategy: "in-place" | "worktree" = assessment.clean ? "in-place" : "worktree";
-			const original = { branch: info.branch, head: info.head, dirty: info.dirty };
+			let strategy: "in-place" | "worktree";
+			let original: { branch: string; head: string; dirty: string[] };
 
 			// Take the control lease before mutating Git, and confirm the active
 			// workflow has not changed underneath us.
@@ -946,16 +956,16 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				throw new RpacGuardError("the active workflow changed while preview confirmation was pending — review status and retry");
 			}
 
-			let outcome;
-			try {
-				outcome = performPrCheckout(root, resolved, strategy, gh, remote);
-			} catch (err) {
-				throw new RpacGuardError(`PR checkout failed: ${(err as Error).message}`);
-			}
+			// Reassess AFTER confirmation and lease acquisition. Local work may have
+			// appeared while metadata or a dialog was pending.
+			const fresh = assessPrCheckout(root);
+			strategy = fresh.clean ? "in-place" : "worktree";
+			const freshInfo = gitInfo(root);
+			original = { branch: freshInfo.branch, head: freshInfo.head, dirty: freshInfo.dirty };
 
-			// Ensure the base + head objects are present locally for the diff.
+			// Preflight objects and the full diff before changing any checkout.
 			if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
-				if (resolved.baseRef) runGitText(root, ["fetch", remote, resolved.baseRef], true);
+				runGitText(root, ["fetch", remote, `refs/pull/${prNumber}/head`, `refs/heads/${resolved.baseRef}`]);
 				if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
 					throw new RpacGuardError(
 						`the PR base/head objects are not available locally (base ${resolved.baseSha.slice(0, 12)}, head ${resolved.headSha.slice(0, 12)}) — ` +
@@ -964,8 +974,14 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				}
 			}
 
+			const snapshot = capturePrSnapshot(root, resolved.baseSha, resolved.headSha, prNumber);
+			let outcome;
+			try {
+				outcome = performPrCheckout(root, resolved, strategy, gh, remote);
+			} catch (err) {
+				throw new RpacGuardError(`PR checkout failed: ${(err as Error).message}`);
+			}
 			const prMeta = buildPrMeta(resolved, outcome, original);
-			const snapshot = captureStablePrSnapshot(root, prMeta, []);
 			const manifestText = JSON.stringify(snapshot, null, 2) + "\n";
 			const state = newReviewState(root, {
 				mode: PR_REVIEW_MODE,
@@ -1717,9 +1733,10 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 
 	async function cmdPrCleanup(ctx: ExtensionCommandContext, args: string): Promise<void> {
 		const root = rootOf(ctx.cwd);
-		const { flags } = parseFlags(args.trim().split(/\s+/).filter(Boolean));
+		const { flags, rest } = parseFlags(args.trim().split(/\s+/).filter(Boolean));
 		let controlLease = false;
 		try {
+			if (rest || [...flags].some(flag => flag !== "yes")) throw new RpacGuardError("Usage: /rpac pr-cleanup [--yes]");
 			const { state } = loadActive(root, root);
 			if (!state) {
 				ctx.ui.notify("RPAC: no active workflow.", "info");
@@ -1731,7 +1748,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			const pr = state.review!.pr!;
 			if (pr.checkoutStrategy !== "worktree") {
 				ctx.ui.notify(
-					`RPAC: this PR review used the in-place checkout. RPAC does not auto-restore the branch (it could overwrite new work). To return to the pre-review state run:\n  git checkout ${pr.originalBranch || "(detached)"}\n  (original HEAD ${pr.originalHead.slice(0, 8)})`,
+					`RPAC: this PR review used the in-place checkout. RPAC does not auto-restore the branch (it could overwrite new work). To return to the pre-review state run:\n  ${prRestoreCommand(pr)}\n  (original HEAD ${pr.originalHead.slice(0, 8)})`,
 					"info",
 				);
 				return;
@@ -1750,7 +1767,9 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			}
 			acquireActLease(root, "control:pr-cleanup");
 			controlLease = true;
-			const result = removePrWorktree(root, pr.number);
+			if (loadActive(root, root).state?.id !== state.id) throw new RpacGuardError("active workflow changed while cleanup confirmation was pending");
+			if (pr.checkoutLocation !== prWorktreePath(root, pr.number)) throw new RpacGuardError("recorded PR worktree location does not match; refusing cleanup");
+			const result = removePrWorktree(root, pr.number, pr.headSha);
 			releaseLock(root, LEASE_NAME);
 			controlLease = false;
 			appendLog(root, state.id, `- **${nowIso()}** pr-cleanup: ${result}`);
@@ -1783,7 +1802,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			if (state.review.pr) {
 				const pr = state.review.pr;
 				lines.push(`- PR: #${pr.number} ${pr.url} (${pr.state}) — "${pr.title}"; base ${pr.baseRef}@${pr.baseSha.slice(0, 8)} → head ${pr.headRef}@${pr.headSha.slice(0, 8)}`);
-				lines.push(`- PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}${pr.checkoutStrategy === "in-place" ? ` (restore: git checkout ${pr.originalBranch || "(detached)"})` : " (cleanup: /rpac pr-cleanup)"}`);
+				lines.push(`- PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}${pr.checkoutStrategy === "in-place" ? ` (restore: ${prRestoreCommand(pr)})` : " (cleanup: /rpac pr-cleanup)"}`);
 			}
 		}
 		lines.push("");
@@ -2037,6 +2056,10 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 						break;
 					}
 					case "plan_complete": {
+						const active = loadActive(root, root).state;
+						if (active && isPrReview(active) && (params.reviewChecks ?? []).some(check => !hasPrCheckDirectory(active, check))) {
+							throw new RpacGuardError(`PR review checks must include the checkout directory in the exact approved command: ${prCheckPrefix(active.review!.pr!.checkoutLocation)}`);
+						}
 						const res = run((s) => planComplete(
 							s,
 							artifactFile(root, s.id, "plan"),
@@ -2238,11 +2261,16 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			if (state.workflowKind === "review" || state.phase === "refine" || state.phase === "plan") {
 				const decision = gateToolCall(state, ctx.cwd, event.toolName, event.input as Record<string, unknown> | undefined, root);
 				if (decision) return { block: true, reason: decision.reason };
+				if (isPrReview(state) && typeof (event.input as Record<string, unknown>)?.command === "string" &&
+					isApprovedReviewCheck(state, (event.input as { command: string }).command)) {
+					assertPrCheckout(root, state.review!.pr!);
+				}
 			}
 			// Activity refresh: the model is making progress on an ACT task.
 			if (state.phase === "act" && holdsLock(root, LEASE_NAME)) refreshLock(root, LEASE_NAME);
-		} catch {
-			// The gate must never take tool execution down with it.
+		} catch (err) {
+			// Failure to establish review/check provenance must not allow execution.
+			return { block: true, reason: `RPAC cannot safely authorize this tool call: ${(err as Error).message}` };
 		}
 	});
 

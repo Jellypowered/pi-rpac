@@ -191,22 +191,37 @@ a mock CLI (no network, no real GitHub).
     so nothing is lost.
   - **worktree** (dirty tree): a `git worktree` is created at a deterministic sibling path, fetched
     to the head ref, and checked out detached there — the main work tree is left byte-for-byte
-    untouched. `/rpac pr-cleanup` removes only that worktree.
-  - After either path the head object is verified present locally (`git cat-file`), and the
-    checkout's actual HEAD is asserted equal to the resolved head SHA before the snapshot runs.
+    untouched. `/rpac pr-cleanup` removes only that worktree after checking its Git registration,
+    common repository, administrative ownership record, pinned HEAD, and clean status including
+    ignored/untracked files. Symlinked paths, hidden index flags, and unowned/legacy directories
+    are refused. Removal uses ordinary `git worktree remove`, never force or filesystem fallback.
+  - Objects and the merge-base diff are preflighted before checkout. The checkout's actual HEAD
+    is asserted equal to the resolved head SHA before the workflow is persisted.
 - **Scope = `base...head`.** `capturePrSnapshot` diffs the pinned base and head commits by object
   (not by work tree), producing the same manifest-item shape as `review.ts` but with `base` and `pr`
-  content layers. Added/modified/deleted/renamed files are all represented; fork PRs work because
-  the head is fetched by object. Both commits must exist locally or the start fails cleanly.
+  content layers. `base` is read from the unique merge-base, NOT the base tip. Byte-keyed `ls-tree`
+  maps and the shared blob reader preserve raw path identities, modes, symlinks, and gitlinks.
+  Added/modified/deleted/renamed files are all represented; fork PRs work because the head is
+  fetched via the base repository's PR ref. Both commits must exist locally or the start fails cleanly.
 - **Untrusted input, report-only.** The PR is someone else's diff. Execution stays mechanically
-  report-only in every phase (the all-phase review gate), and `gh` is used **read-only**: only
-  `--version`, `auth status`, `pr view`, and `pr checkout`/fetch are ever invoked. No `gh pr
+  report-only in every phase (the all-phase review gate). Native preparation/freshness uses only
+  `gh --version`, `gh auth status`, `gh pr view`, `gh pr checkout --detach`, and Git fetch. No `gh pr
   review/merge/close/create`, no `api` mutation, no posting of findings to GitHub. The report is
   advisory.
 - **Drift / force-push.** Base and head SHAs are pinned at start. On ACT/resume/consolidate the
-  head is re-resolved via `gh pr view`; if it differs from the pinned head, the PR was force-pushed:
-  all coverage is invalidated, the mismatch is persisted as drift and surfaced, and the reviewed
-  commit is **not** silently switched. Reviewing a new head requires aborting and starting fresh.
+  base/head and repository identity are re-resolved via `gh pr view`. Changed refs, retargets,
+  freshness failures, and dirty/missing/wrong-HEAD checkouts invalidate all coverage and persist
+  drift, even for empty scopes. The reviewed commit is **not** silently switched.
+- **Verification execution.** Every PR check includes a canonical shell-quoted `cd -- '<checkout>' && `
+  prefix as part of the exact user-approved command. The gate refuses unqualified checks,
+  directory-switch suffixes, and PowerShell execution of POSIX checks; it also validates the
+  checkout before dispatch. Direct `gh` and known Git-state mutations stay blocked even if
+  listed in a plan. Approved scripts are not an OS sandbox; external isolation remains a user choice.
+- **Failure/concurrency.** Objects and the full diff are preflighted before checkout. Safety is
+  reassessed after acquiring the control lease; fetch errors cannot reuse stale refs. In-place
+  failures restore the original branch/commit only when safe without forcing; otherwise they
+  preserve work and print manual recovery details. Cleanup revalidates the active workflow after
+  confirmation. Existing ordinary review/approval/lease machinery remains shared.
 
 ### 2.3 Concurrency — real exclusion, not advisory
 

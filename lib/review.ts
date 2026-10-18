@@ -81,7 +81,7 @@ export interface ReviewDrift {
 	changedItemIds: string[];
 }
 
-interface GitEntry {
+export interface GitEntry {
 	path: Buffer;
 	mode: string;
 	oid: string;
@@ -169,7 +169,7 @@ function parseLsFiles(data: Buffer): { entries: Map<string, GitEntry>; conflicts
 	return { entries, conflicts };
 }
 
-function parseLsTree(data: Buffer): Map<string, GitEntry> {
+export function parseLsTree(data: Buffer): Map<string, GitEntry> {
 	const result = new Map<string, GitEntry>();
 	for (const record of splitNul(data)) {
 		const tab = record.indexOf(0x09);
@@ -245,10 +245,10 @@ export function canonicalJson(value: unknown): string {
 	return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
 }
 
-function blobLayer(
+export function blobLayer(
 	root: string,
 	entry: GitEntry | undefined,
-	source: "head" | "index",
+	source: ReviewLayerName,
 	blobCache: Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>,
 ): ReviewLayer {
 	if (!entry) return { source, state: "deleted" };
@@ -312,7 +312,7 @@ function worktreeLayer(root: string, path: Buffer, index: GitEntry | undefined):
 	};
 }
 
-function isInternalRpacPath(path: Buffer): boolean {
+export function isInternalRpacPath(path: Buffer): boolean {
 	const text = path.toString("utf8").replaceAll("\\", "/");
 	return text === ".pi/rpac" || text.startsWith(".pi/rpac/");
 }

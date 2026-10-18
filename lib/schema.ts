@@ -267,12 +267,13 @@ const PR_STRATEGY_SET = new Set<string>(["in-place", "worktree"]);
 function parsePrMeta(raw: unknown): PrReviewMeta | undefined {
 	if (raw === undefined) return undefined;
 	if (!isRecord(raw)) throw new RpacStateError("corrupt", "review pr metadata is not an object");
-	if (!isNumber(raw.number) || !Number.isInteger(raw.number) || raw.number < 1) {
+	if (!isNumber(raw.number) || !Number.isSafeInteger(raw.number) || raw.number < 1) {
 		throw new RpacStateError("corrupt", "review pr metadata has an invalid PR number");
 	}
 	for (const key of ["url", "title", "body", "repository", "baseRef", "baseSha", "headRef", "headSha", "originalBranch", "originalHead", "checkoutStrategy", "checkoutLocation", "checkedOutAt"] as const) {
 		if (!isString(raw[key])) throw new RpacStateError("corrupt", `review pr metadata is missing ${key}`);
 	}
+	if (typeof raw.crossRepository !== "boolean") throw new RpacStateError("corrupt", "review pr metadata has invalid crossRepository");
 	if (!isGitSha(raw.baseSha) || !isGitSha(raw.headSha)) throw new RpacStateError("corrupt", "review pr metadata has invalid base/head SHAs");
 	if (!isString(raw.state) || !PR_STATE_SET.has(raw.state as string)) throw new RpacStateError("corrupt", "review pr metadata has an invalid PR state");
 	if (!isString(raw.checkoutStrategy) || !PR_STRATEGY_SET.has(raw.checkoutStrategy as string)) throw new RpacStateError("corrupt", "review pr metadata has an invalid checkout strategy");
@@ -580,9 +581,10 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 		}
 		state.artifacts.reviewManifest = { ...manifest };
 		const pr = parsePrMeta(review.pr);
-		if ((review.mode as string) === PR_REVIEW_MODE && !pr) {
-			throw new RpacStateError("corrupt", "pr review workflow is missing its pr metadata");
+		if (((review.mode as string) === PR_REVIEW_MODE) !== Boolean(pr)) {
+			throw new RpacStateError("corrupt", "pr review mode and metadata must occur together");
 		}
+		if (pr && review.head !== pr.headSha) throw new RpacStateError("corrupt", "pr review HEAD does not match pinned head SHA");
 		state.review = {
 			mode: review.mode as ReviewMode,
 			fingerprint: review.fingerprint,
