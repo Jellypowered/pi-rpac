@@ -22,7 +22,42 @@ export const WORKFLOW_KINDS = ["implementation", "review"] as const;
 export type WorkflowKind = (typeof WORKFLOW_KINDS)[number];
 
 export const REVIEW_MODES = ["current", "staged", "full"] as const;
-export type ReviewMode = (typeof REVIEW_MODES)[number];
+/** GitHub PR review mode — a distinct source from the worktree snapshot modes. */
+export const PR_REVIEW_MODE = "pr" as const;
+export const ALL_REVIEW_MODES = [...REVIEW_MODES, PR_REVIEW_MODE] as const;
+export type ReviewMode = (typeof ALL_REVIEW_MODES)[number];
+
+/**
+ * Durable identity + checkout record for a GitHub PR review. Present exactly
+ * when a review workflow targets a pull request (mode "pr"). The snapshot
+ * scope is the object-level base...head diff; the checkout only makes the PR
+ * head inspectable/testable and is a preparation step, not mutation permission.
+ */
+export interface PrReviewMeta {
+	number: number;
+	url: string;
+	title: string;
+	body: string;
+	/** base repository as "owner/name" (the repository the PR targets). */
+	repository: string;
+	state: "open" | "closed" | "merged";
+	/** head lives in a fork (cross-repository PR). */
+	crossRepository: boolean;
+	baseRef: string;
+	baseSha: string;
+	headRef: string;
+	headSha: string;
+	headRepositoryOwner?: string;
+	/** repository state captured before the checkout (restore reference). */
+	originalBranch: string;
+	originalHead: string;
+	originalDirty: string[];
+	/** "in-place" (gh pr checkout in this worktree) or "worktree" (isolated). */
+	checkoutStrategy: "in-place" | "worktree";
+	/** absolute location where the PR head was checked out for inspection. */
+	checkoutLocation: string;
+	checkedOutAt: string;
+}
 
 export interface RpacReviewState {
 	mode: ReviewMode;
@@ -38,6 +73,8 @@ export interface RpacReviewState {
 	uncoveredItemIds: string[];
 	approvedChecks: string[];
 	exclusions: { path: string; reason: string }[];
+	/** GitHub PR review metadata; present exactly when mode is "pr". */
+	pr?: PrReviewMeta;
 	drift?: {
 		detectedAt: string;
 		fingerprint: string;
@@ -189,7 +226,7 @@ const STATUS_SET = new Set<string>(TASK_STATUSES);
 const RESULT_SET = new Set<string>(["pass", "fail", "unavailable"]);
 const CHECK_KIND_SET = new Set<string>(["acceptance", "observation"]);
 const WORKFLOW_KIND_SET = new Set<string>(WORKFLOW_KINDS);
-const REVIEW_MODE_SET = new Set<string>(REVIEW_MODES);
+const REVIEW_MODE_SET = new Set<string>(ALL_REVIEW_MODES);
 
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -213,6 +250,58 @@ function isStringArray(v: unknown): v is string[] {
 
 function isSha(v: unknown): v is string {
 	return isString(v) && /^[0-9a-f]{64}$/.test(v);
+}
+
+/**
+ * A full git commit SHA: 40 hex (SHA-1, the default) or 64 hex (SHA-256
+ * repositories). Distinct from `isSha`, which is a 64-hex content digest.
+ */
+function isGitSha(v: unknown): v is string {
+	return isString(v) && (/^[0-9a-f]{40}$/.test(v) || /^[0-9a-f]{64}$/.test(v));
+}
+
+const PR_STATE_SET = new Set<string>(["open", "closed", "merged"]);
+const PR_STRATEGY_SET = new Set<string>(["in-place", "worktree"]);
+
+/** Parse + validate the optional `pr` review metadata block. */
+function parsePrMeta(raw: unknown): PrReviewMeta | undefined {
+	if (raw === undefined) return undefined;
+	if (!isRecord(raw)) throw new RpacStateError("corrupt", "review pr metadata is not an object");
+	if (!isNumber(raw.number) || !Number.isSafeInteger(raw.number) || raw.number < 1) {
+		throw new RpacStateError("corrupt", "review pr metadata has an invalid PR number");
+	}
+	for (const key of ["url", "title", "body", "repository", "baseRef", "baseSha", "headRef", "headSha", "originalBranch", "originalHead", "checkoutStrategy", "checkoutLocation", "checkedOutAt"] as const) {
+		if (!isString(raw[key])) throw new RpacStateError("corrupt", `review pr metadata is missing ${key}`);
+	}
+	if (typeof raw.crossRepository !== "boolean") throw new RpacStateError("corrupt", "review pr metadata has invalid crossRepository");
+	if (!isGitSha(raw.baseSha) || !isGitSha(raw.headSha)) throw new RpacStateError("corrupt", "review pr metadata has invalid base/head SHAs");
+	if (!isString(raw.state) || !PR_STATE_SET.has(raw.state as string)) throw new RpacStateError("corrupt", "review pr metadata has an invalid PR state");
+	if (!isString(raw.checkoutStrategy) || !PR_STRATEGY_SET.has(raw.checkoutStrategy as string)) throw new RpacStateError("corrupt", "review pr metadata has an invalid checkout strategy");
+	if (!Array.isArray(raw.originalDirty) || !raw.originalDirty.every(isString)) {
+		throw new RpacStateError("corrupt", "review pr metadata has invalid originalDirty");
+	}
+	const str = (key: string): string => raw[key] as string;
+	const pr: PrReviewMeta = {
+		number: raw.number,
+		url: str("url"),
+		title: str("title"),
+		body: str("body"),
+		repository: str("repository"),
+		state: raw.state as PrReviewMeta["state"],
+		crossRepository: Boolean(raw.crossRepository),
+		baseRef: str("baseRef"),
+		baseSha: str("baseSha"),
+		headRef: str("headRef"),
+		headSha: str("headSha"),
+		originalBranch: str("originalBranch"),
+		originalHead: str("originalHead"),
+		originalDirty: [...(raw.originalDirty as string[])],
+		checkoutStrategy: raw.checkoutStrategy as PrReviewMeta["checkoutStrategy"],
+		checkoutLocation: str("checkoutLocation"),
+		checkedOutAt: str("checkedOutAt"),
+	};
+	if (isString(raw.headRepositoryOwner)) pr.headRepositoryOwner = raw.headRepositoryOwner;
+	return pr;
 }
 
 /**
@@ -491,6 +580,11 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 			throw new RpacStateError("corrupt", "review manifest artifact does not match review snapshot state");
 		}
 		state.artifacts.reviewManifest = { ...manifest };
+		const pr = parsePrMeta(review.pr);
+		if (((review.mode as string) === PR_REVIEW_MODE) !== Boolean(pr)) {
+			throw new RpacStateError("corrupt", "pr review mode and metadata must occur together");
+		}
+		if (pr && review.head !== pr.headSha) throw new RpacStateError("corrupt", "pr review HEAD does not match pinned head SHA");
 		state.review = {
 			mode: review.mode as ReviewMode,
 			fingerprint: review.fingerprint,
@@ -503,6 +597,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 			uncoveredItemIds: [...new Set(review.uncoveredItemIds as string[])],
 			approvedChecks: [...new Set(review.approvedChecks as string[])],
 			exclusions,
+			...(pr ? { pr } : {}),
 		};
 		if (review.drift !== undefined) {
 			if (!isRecord(review.drift) || !isString(review.drift.detectedAt) || !isSha(review.drift.fingerprint) ||
@@ -614,6 +709,10 @@ export interface NewReviewStateInput {
 	capturedAt: string;
 	scopeItemIds: string[];
 	exclusions?: { path: string; reason: string }[];
+	/** GitHub PR metadata (required when mode is "pr"). */
+	pr?: PrReviewMeta;
+	/** override the default "Self-review …" task string. */
+	task?: string;
 }
 
 /** Create a review workflow around a manifest already captured on disk. */
@@ -623,7 +722,8 @@ export function newReviewState(
 	now = nowIsoDefault(),
 ): RpacState {
 	if (!isSha(input.manifestSha256)) throw new Error("review manifest SHA-256 is invalid");
-	const state = newState(project, `Self-review ${input.mode} snapshot`, now);
+	if (input.mode === PR_REVIEW_MODE && !input.pr) throw new Error("pr review requires pr metadata");
+	const state = newState(project, input.task ?? `Self-review ${input.mode} snapshot`, now);
 	state.workflowKind = "review";
 	const manifest = {
 		path: `.pi/rpac/${state.id}/review-manifest.json`,
@@ -643,6 +743,7 @@ export function newReviewState(
 		uncoveredItemIds: [],
 		approvedChecks: [],
 		exclusions: input.exclusions?.map((entry) => ({ ...entry })) ?? [],
+		...(input.pr ? { pr: { ...input.pr, originalDirty: [...input.pr.originalDirty] } } : {}),
 	};
 	return state;
 }

@@ -17,7 +17,7 @@ import { nowIso } from "./util.ts";
 export const REVIEW_MODES = ["current", "staged", "full"] as const;
 export type ReviewMode = (typeof REVIEW_MODES)[number];
 
-export type ReviewLayerName = "head" | "index" | "worktree";
+export type ReviewLayerName = "head" | "index" | "worktree" | "base" | "pr";
 export type ReviewObjectKind = "file" | "symlink" | "gitlink" | "other";
 
 export interface ReviewLayer {
@@ -81,7 +81,7 @@ export interface ReviewDrift {
 	changedItemIds: string[];
 }
 
-interface GitEntry {
+export interface GitEntry {
 	path: Buffer;
 	mode: string;
 	oid: string;
@@ -99,12 +99,13 @@ interface StatusEntry {
 }
 
 const LARGE_FILE_BYTES = 1024 * 1024;
+export { LARGE_FILE_BYTES };
 
-function sha256(data: Buffer | string): string {
+export function sha256(data: Buffer | string): string {
 	return createHash("sha256").update(data).digest("hex");
 }
 
-function runGitBuffer(root: string, args: string[], allowFailure = false): Buffer {
+export function runGitBuffer(root: string, args: string[], allowFailure = false): Buffer {
 	try {
 		return execFileSync("git", args, {
 			cwd: root,
@@ -120,11 +121,11 @@ function runGitBuffer(root: string, args: string[], allowFailure = false): Buffe
 	}
 }
 
-function runGitText(root: string, args: string[], allowFailure = false): string {
+export function runGitText(root: string, args: string[], allowFailure = false): string {
 	return runGitBuffer(root, args, allowFailure).toString("utf8").trim();
 }
 
-function splitNul(data: Buffer): Buffer[] {
+export function splitNul(data: Buffer): Buffer[] {
 	const result: Buffer[] = [];
 	let start = 0;
 	for (let i = 0; i < data.length; i++) {
@@ -136,15 +137,15 @@ function splitNul(data: Buffer): Buffer[] {
 	return result;
 }
 
-function pathKey(path: Buffer): string {
+export function pathKey(path: Buffer): string {
 	return path.toString("base64");
 }
 
-function displayPath(path: Buffer): string {
+export function displayPath(path: Buffer): string {
 	return path.toString("utf8");
 }
 
-function itemId(path: Buffer): string {
+export function itemId(path: Buffer): string {
 	return `ri-${sha256(path).slice(0, 20)}`;
 }
 
@@ -168,7 +169,7 @@ function parseLsFiles(data: Buffer): { entries: Map<string, GitEntry>; conflicts
 	return { entries, conflicts };
 }
 
-function parseLsTree(data: Buffer): Map<string, GitEntry> {
+export function parseLsTree(data: Buffer): Map<string, GitEntry> {
 	const result = new Map<string, GitEntry>();
 	for (const record of splitNul(data)) {
 		const tab = record.indexOf(0x09);
@@ -237,17 +238,17 @@ function parseStatus(data: Buffer): StatusEntry[] {
 	return result;
 }
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const object = value as Record<string, unknown>;
 	return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
 }
 
-function blobLayer(
+export function blobLayer(
 	root: string,
 	entry: GitEntry | undefined,
-	source: "head" | "index",
+	source: ReviewLayerName,
 	blobCache: Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>,
 ): ReviewLayer {
 	if (!entry) return { source, state: "deleted" };
@@ -311,12 +312,12 @@ function worktreeLayer(root: string, path: Buffer, index: GitEntry | undefined):
 	};
 }
 
-function isInternalRpacPath(path: Buffer): boolean {
+export function isInternalRpacPath(path: Buffer): boolean {
 	const text = path.toString("utf8").replaceAll("\\", "/");
 	return text === ".pi/rpac" || text.startsWith(".pi/rpac/");
 }
 
-function selectStatus(status: StatusEntry[], mode: ReviewMode): StatusEntry[] {
+function selectStatus(status: StatusEntry[], mode: string): StatusEntry[] {
 	if (mode === "current") return status;
 	return status.filter((entry) => entry.conflicted || (!entry.untracked && entry.xy[0] !== "."));
 }
@@ -337,8 +338,8 @@ function patchHash(root: string, args: string[], excludedPaths: string[]): strin
 }
 
 /** Capture the selected Git state without writing to the repository. */
-export function captureReviewSnapshot(root: string, mode: ReviewMode, exclusions: ReviewExclusion[] = []): ReviewSnapshot {
-	if (!REVIEW_MODES.includes(mode)) throw new Error(`unsupported review mode: ${String(mode)}`);
+export function captureReviewSnapshot(root: string, mode: string, exclusions: ReviewExclusion[] = []): ReviewSnapshot {
+	if (!(REVIEW_MODES as readonly string[]).includes(mode)) throw new Error(`unsupported review mode: ${String(mode)}`);
 	const top = runGitText(root, ["rev-parse", "--show-toplevel"], true);
 	if (!top) throw new Error("review requires a Git work tree");
 	const resolvedRoot = top;
@@ -444,7 +445,7 @@ export function captureReviewSnapshot(root: string, mode: ReviewMode, exclusions
 	const fingerprint = sha256(canonicalJson(fingerprintInput));
 	return {
 		version: 1,
-		mode,
+		mode: mode as ReviewMode,
 		root: resolvedRoot,
 		head: head || "unborn",
 		unborn,
@@ -459,7 +460,7 @@ export function captureReviewSnapshot(root: string, mode: ReviewMode, exclusions
 }
 
 /** Compare identities, ignoring capture timestamps and display-only path text. */
-export function compareReviewSnapshots(before: ReviewSnapshot, after: ReviewSnapshot): ReviewDrift {
+export function compareReviewSnapshots(before: Pick<ReviewSnapshot, "items" | "fingerprint">, after: Pick<ReviewSnapshot, "items" | "fingerprint">): ReviewDrift {
 	const oldItems = new Map(before.items.map((item) => [item.id, canonicalJson(item)]));
 	const newItems = new Map(after.items.map((item) => [item.id, canonicalJson(item)]));
 	const addedItemIds = [...newItems.keys()].filter((id) => !oldItems.has(id)).sort();
