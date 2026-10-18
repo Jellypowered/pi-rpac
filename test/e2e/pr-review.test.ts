@@ -238,9 +238,13 @@ test("PR review happy path: in-place checkout, full lifecycle, report-only, no g
 		// Drive to act; report-only gate enforced + approved check allowed.
 		const { id: pid, itemIds } = await driveToAct(m, env.work);
 		assert.equal(pid, id);
+		const approvedState = readFileSync(join(workflowDirPath(env.work, id), "workflow.json"), "utf8");
+		await rpacCmd(m, env.work, "style technical --project");
+		assert.equal(readFileSync(join(workflowDirPath(env.work, id), "workflow.json"), "utf8"), approvedState);
 		await rpacCmd(m, env.work, "act");
 		s = readState(env.work, id);
 		assert.equal(s.tasks[0].status, "in_progress");
+		assert.equal(s.review.drift, undefined, "presentation preference does not contaminate in-place PR evidence");
 		const gate = async (toolName: string, input: Record<string, unknown>) =>
 			fire(m, "tool_call", { type: "tool_call", toolName, input }, { cwd: env.work }) as Promise<unknown>;
 		// Approved, non-destructive check is allowed.

@@ -44,7 +44,7 @@ Self-contained: a fresh session reading **only this file** can execute it.
 # Plan — <task>
 
 ## Summary
-1–3 sentences: what this implements and the overall shape of the change.
+1–3 plain-language sentences: what this implements and the overall shape of the change. Keep exact tasks, commands and criteria below.
 
 ## Conventions
 Cross-cutting rules that bind every task (naming, strings, test approach, lint/build commands).

@@ -59,6 +59,10 @@ duplicate Pi's native mechanisms and lose approval/state enforcement.
   manual-fallback message).
 - `pi.on("tool_call", (event, ctx) => { block?: true, reason? })` — the hook that makes the
   planning/review read-only gates mechanical (see §2.5).
+- `pi.on("context", ...)` runs before each model invocation, transforming request-local conversation
+  messages while Pi restores its system/tool messages. A `custom` message converts to user-role
+  content, not a system instruction. Used for dynamically resolved communication preferences.
+  Verified against development Pi 1.1.0 and installed Pi 1.3.0 declarations, runner and message conversion.
 - `pi.on("before_agent_start", ...)` returning `{message: {customType, content, display:
   false}}` — tiny per-turn phase context (see §2.6).
 - `pi.on("agent_end" | "session_start" | "session_shutdown", ...)` — lifecycle for lease
@@ -83,6 +87,8 @@ pi-rpac/
 │   ├── git.ts            # ordinary baseline/divergence detection (excludes .pi/)
 │   ├── review.ts         # byte-safe Git snapshots, manifests, fingerprints, drift (pure)
 │   ├── pr.ts             # GitHub PR review: gh resolution, safe checkout, base...head scope (pure)
+│   ├── styles.ts         # versioned presentation preferences, registry, parser, request contract
+│   ├── presentation.ts   # human progress/error/approval summaries (no state mutations)
 │   ├── prompts.ts        # phase directives + tiny per-turn phase context
 │   ├── paths.ts          # v3 layout/artifact resolution, workflow-id validation
 │   └── util.ts           # sha256, atomicWriteFile (fsync file+dir), nowIso (pure)
@@ -154,7 +160,8 @@ Rules:
 `lib/review.ts` invokes Git with argument arrays and consumes NUL-delimited output as bytes. Raw
 pathname identity is retained as base64; display UTF-8 is never authoritative. Canonical sorted
 JSON and SHA-256 bind the mode, HEAD/unborn baseline, applicable staged/unstaged patches, and every
-manifest layer. `.git` and `.pi/rpac/**` are unconditional exclusions.
+manifest layer. `.git`, `.pi/rpac/**` and the exact `.pi/rpac-style.json` presentation preference file are
+unconditional exclusions. Preferences must not introduce review drift merely by switching voice.
 
 - `current` records the union of staged, unstaged, and non-ignored untracked paths with separate
   HEAD/index/worktree identities, including staged edits canceled on disk.
@@ -353,6 +360,85 @@ workflows are gated in REFINE/PLAN; review workflows are gated in every non-term
   is persisted/surfaced; the reviewed commit is never silently switched.
 - Drift is **reported, never auto-resolved**; incomplete review completion does not erase it.
 
+### 2.8 Communication is separate from workflow policy
+
+**Two layers.** `styles.ts` and `presentation.ts` affect human explanations only. `schema.ts`,
+`machine.ts`, `store.ts`, approvals, artifact hashes, manifest identity, evidence ledgers and
+verification results remain authoritative and structurally unchanged. Machine result messages and
+logs remain exact; the UI can add a shorter explanation. New requirements/plans/reports use their
+existing Context/Summary/Verdict/Outcome openings for an evidence-derived plain-language summary.
+No historical artifact is rewritten. No style selection is persisted in a workflow record.
+
+**Preference files and resolution.** Personal `<getAgentDir()>/rpac-style.json` and project-root
+`.pi/rpac-style.json` use `{version: 1, style?: identifier, styles?: definitions}`. Project selection
+wins over personal selection, then Natural. Bare `/rpac style <id>` writes the project override;
+`--global`, `--project` and `--reset-project` are strictly parsed, including duplicate/conflicting
+flag refusal. Reset removes only the selection, retaining custom definitions. Commands are available
+without an active workflow and do not dispatch a model turn or call a workflow transition.
+Completions use the most recent command/session root, initially Pi's process cwd, since Pi's
+completion callback supplies only the argument prefix, not an extension context.
+
+Built-ins have six distinct voice instructions and milestone variants. Custom styles are validated
+text records (name, description, instructions, optional examples), merged into the registry without
+allowing built-in replacement. Project/global custom collisions warn and retain the global definition.
+Global selections cannot depend on project-only definitions. Unknown selections fall back with a
+warning. Missing files are normal; malformed/unsupported files fall back and are preserved. A write
+refuses malformed target config rather than discarding it. Files use the existing atomic/fsync writer;
+configuration is reread, not cached. Writes do not merge simultaneous external edits transactionally.
+No new dependencies, services, watchers or model calls are introduced.
+
+Validation bounds: file 64 KiB; 32 styles per file; identifier 48 characters; name 80; description
+240; instructions 1,600; examples at most 3 × 240. Exact allowed keys, non-empty text, reserved IDs,
+control characters, symlinked files and symlinked write directories are checked. Identifiers never
+become file paths. No custom imports, file references, templates or executable configuration exist.
+
+**Supported Pi hooks, not rendered-output rewriting.** The existing `before_agent_start` phase
+pointer remains unchanged. A separate `context` hook reads actual disk workflow state and preferences
+before *each* model invocation, including tool continuations. It supplies one hidden request-local
+`rpac-style` custom message only for non-paused, non-terminal workflows. Pi converts it to user-role
+content. It never returns `systemPrompt`, changes structured system-prompt sections, uses
+`context_with_system`, changes tool declarations or transforms assistant output. Existing messages and
+other extensions' messages are preserved; any prior RPAC-owned style message is removed defensively.
+The message is not appended to session history, so compaction and handoff cannot accumulate stale
+style instructions. Disk resumption supplies the current voice. Unreadable state means no style
+injection; the existing tool gate continues to fail closed. Preference warnings are deduplicated per
+runtime; `/rpac style` always exposes current warnings.
+
+The fixed instruction contract limits the preference to human-facing wording, prioritizes higher
+instructions and explicit user requests, preserves exact evidence/schemas/tools, requires failures
+and limitations to remain visible, and encourages meaningful milestones rather than chatter. Custom
+instructions/examples are JSON-encoded untrusted presentation data with explicit rejection of
+operational requests. This cannot guarantee that an arbitrary model resists every textual injection;
+it does not grant any new capability or remove mechanical gates. Tests assert policy separation and
+actual enforced refusals, not that a model's subjective tone is proven safe or polished.
+
+**Review metadata isolation.** `isReviewMetadataPath` excludes only the dedicated preference file
+in addition to existing internal RPAC paths. It is deliberately separate from `isInternalRpacPath`,
+which remains the stricter checkout/removal cleanliness predicate. Only in-place evidence checks at
+the recorded project root may disregard the preference change; preparation and cleanup do not.
+Rename pairs must have both paths allowed, so a source-to-metadata rename is still contamination.
+Snapshots also retain a source renamed into preference metadata as a reviewed source deletion;
+excluding the destination must not hide shipping-file changes. The new preference-path match uses
+exact bytes, not backslash normalization that could hide an unrelated POSIX filename.
+The preference file remains untrusted presentation metadata, not reviewed shipping code. Existing
+manifests and artifacts are not migrated or rewritten; if a pre-feature manifest explicitly included
+this newly reserved metadata path, scope recapture/replanning may be necessary.
+
+**Human-facing surface inventory and treatment:**
+
+| Surface | Presentation / evidence boundary |
+|---|---|
+| `/rpac`, `status`, `help` | Progress and supported next-step opening; readable approval labels. Compact default retains task issues, stale/divergence warnings, PR restoration/cleanup guidance, review coverage/drift. `status --details` retains diagnostics, checks, baseline, events and artifact pointers; Technical keeps detailed status by default. |
+| `start`, `refine`, `plan`, `act`, `consolidate`, `resume` | Plain milestone explanations; six voices where useful. Workflow IDs remain in resume/status/list when needed to select saved work, not every announcement. ACT results/logs remain exact. |
+| Review/PR preview | Explicit report-only boundaries, scope counts and checkout strategy; original PR identities and metadata remain saved. |
+| Approval dialogs and headless notifications | Explain what requirements/plan approval permits and that users may decline; exact artifact pointer and existing confirmation mechanism retained. Sequential/force/replacement warnings remain explicit. |
+| Command/tool errors | Small `humanError` helper adds understandable context/recovery without deleting the original diagnostic. Model tool results also retain `details.diagnostic`; no exception class name is displayed. Unknown cases recommend inspecting status, not a guessed mutating recovery command. |
+| Blocked tools / unreadable state | Existing gate decides; presentation may explain the refusal but cannot authorize execution. Exact gate reason remains in the explanation. |
+| Pause, abort, accept, cleanup, PR cleanup, handoff | Existing clear messages and warnings retained; cleanup clarifies that source files/preferences were not removed. No extra dialogs. |
+| Footer, task widget, list | Compact familiar phase/task indicators and saved-workflow IDs retained; no per-tool progress narration. |
+| Model responses / questions / completion summaries | Request-local communication contract, including terminology guidance, meaningful milestones, exact actionable commands and honest review limitations. Finalized output is not rewritten. |
+| Phase directives and lazy skills | Operational instructions remain precise, independent of voice; only document-opening summary guidance was clarified. |
+
 ## 3. Test strategy
 
 | Area | How |
@@ -366,6 +452,10 @@ workflows are gated in REFINE/PLAN; review workflows are gated in every non-term
 | review snapshots | temp Git fixtures: current/staged/full, empty/unborn, index/worktree layering, deletion/rename/mode, odd bytes, binary/large, symlink, gitlink, conflict, exclusion, deterministic drift |
 | PR review (`lib/pr.ts`) | temp origin+clone fixtures exposing `refs/pull/N/head`: metadata normalization, `parseNameStatus`, `base...head` snapshot layers, exclusions, in-place vs. worktree checkout (dirty tree preserved), `pr-cleanup`, `verifyGitObjects`, SHA validation, deterministic drift |
 | PR review (e2e) | mock `gh` on PATH (no network/GitHub): command parsing, invalid numbers, missing/unauthenticated gh, non-git/missing remote, fork PRs, dirty-tree worktree + main-tree preservation, existing-workflow safeguards, force-push drift invalidation, resume after restart, report-only gate, and an assertion that no mutating `gh` command is ever attempted |
+| communication configuration | unit: six voices, strict parser/completions, custom registry, global/project precedence/reset, fresh reads, malformed recovery, bounds, links, declarative-only schema and adversarial instruction contract |
+| communication lifecycle | mock-Pi: immediate switching, unchanged workflow/artifact bytes, fresh runtime/session/handoff, empty post-compaction context, active phases vs paused/done/aborted/unreadable state, deduplicated warnings, approvals and failed verification remain enforced |
+| communication in installed Pi | real RPC provider requests: commands select all six built-ins; one user-level preference per active invocation/tool continuation, immediate Technical → Chill switching, system prompt retained, no stale history and no style after terminal completion |
+| review preference isolation | current/staged/full snapshots unchanged by metadata edits; in-place PR lifecycle switching does not invalidate approval/evidence; strict cleanup predicates and source rename refusal retained |
 | command + tool interface | mock-Pi e2e: ordinary regressions plus review parsing/modes/empty scope, exclusions, approvals, exact assignment, interruption/resume, report-only gates, drift invalidation/incomplete report, conflict rejection, status/list, replacement safeguards |
 | package resources | frontmatter/action/artifact checks, exact embedded upstream license, both source links, and no product-specific assumptions; no sibling checkout dependency |
 | **real Pi binary** | RPC loads a copied package outside the checkout, dispatches the bundled skill and `/rpac review`, drives an ordinary full workflow, and verifies HEAD/index/reviewed content remain unchanged. Skipped only without `pi`/git. |

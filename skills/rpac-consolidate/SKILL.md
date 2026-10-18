@@ -33,7 +33,7 @@ success.
 # Completion report — <task>
 
 ## Verdict
-Complete / Complete with issues / Incomplete — one line, then the honest summary.
+Complete / Complete with issues / Incomplete — one line, then a short plain-language summary derived from the evidence. Do not omit failures or replace the detailed sections below.
 
 ## Acceptance criteria
 - AC-1: met — <how verified>

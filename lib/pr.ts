@@ -38,6 +38,7 @@ import {
 	parseLsTree,
 	blobLayer,
 	isInternalRpacPath,
+	isReviewMetadataPath,
 } from "./review.ts";
 import { nowIso } from "./util.ts";
 import { gitInfo } from "./git.ts";
@@ -242,7 +243,10 @@ export function selectPrRemote(root: string, pr: ResolvedPr): string {
 }
 
 /** Porcelain v1 -z: XY SP path NUL [original-path NUL for R/C]. Both paths matter. */
-export function cleanPrStatus(output: Buffer): boolean {
+export function cleanPrStatus(output: Buffer, allowPresentation = false): boolean {
+	// Only in-place evidence checks may ignore the dedicated preference file.
+	// Checkout preparation and worktree removal retain their stricter cleanliness.
+	const allowed = allowPresentation ? isReviewMetadataPath : isInternalRpacPath;
 	if (!output.length) return true;
 	if (output[output.length - 1] !== 0) return false;
 	const records: Buffer[] = [];
@@ -257,10 +261,10 @@ export function cleanPrStatus(output: Buffer): boolean {
 		const valid = (c: number) => c === 0x20 || "MADRCTU".includes(String.fromCharCode(c));
 		if (!((x === 0x3f && y === 0x3f) || (x === 0x21 && y === 0x21) ||
 			(valid(x) && valid(y) && (x !== 0x20 || y !== 0x20)))) return false;
-		if (!isInternalRpacPath(record.subarray(3))) return false;
+		if (!allowed(record.subarray(3))) return false;
 		if (x === 0x52 || x === 0x43 || y === 0x52 || y === 0x43) {
 			const original = records[++i];
-			if (!original?.length || !isInternalRpacPath(original)) return false;
+			if (!original?.length || !allowed(original)) return false;
 		}
 	}
 	return true;
@@ -370,7 +374,13 @@ export function capturePrSnapshot(
 	const baseTree = parseLsTree(runGitBuffer(resolvedRoot, ["ls-tree", "-rz", "--full-tree", mergeBaseSha]));
 	const headTree = parseLsTree(runGitBuffer(resolvedRoot, ["ls-tree", "-rz", "--full-tree", headSha]));
 	const data = runGitBuffer(resolvedRoot, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", "-z", mergeBaseSha, headSha]);
-	const records = parseNameStatus(data);
+	const records = parseNameStatus(data).map((record) => {
+		if (record.originalPath && record.status.startsWith("R") && isReviewMetadataPath(record.path) &&
+			!isInternalRpacPath(record.path) && !isReviewMetadataPath(record.originalPath)) {
+			return { status: "D", path: record.originalPath };
+		}
+		return record;
+	});
 	const exclusionSet = new Set(exclusions.map((e) => e.path));
 	const blobCache = new Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>();
 	const items: ReviewManifestItem[] = [];
@@ -378,7 +388,7 @@ export function capturePrSnapshot(
 	for (const rec of ordered) {
 		const key = pathKey(rec.path);
 		const path = displayPath(rec.path);
-		if (isInternalRpacPath(rec.path) || exclusionSet.has(path)) continue;
+		if (isReviewMetadataPath(rec.path) || exclusionSet.has(path)) continue;
 		const basePath = rec.originalPath ?? rec.path;
 		// Raw path bytes are authoritative; never resolve commit:path via UTF-8.
 		const layers: ReviewLayer[] = [
@@ -581,7 +591,7 @@ export function assertPrCheckout(root: string, pr: PrReviewMeta): void {
 	if (runGitText(pr.checkoutLocation, ["rev-parse", "HEAD"]) !== pr.headSha) throw new Error("PR checkout HEAD differs from the reviewed commit");
 	if (hasHiddenIndexEntries(pr.checkoutLocation)) throw new Error("PR checkout index hides potential local changes; verification evidence is untrusted");
 	const status = runGitBuffer(pr.checkoutLocation, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
-	if (!cleanPrStatus(status)) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
+	if (!cleanPrStatus(status, pr.checkoutStrategy === "in-place" && resolve(root) === resolve(pr.checkoutLocation))) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
 }
 
 /** Re-resolve the current PR head SHA (for force-push / drift detection). */

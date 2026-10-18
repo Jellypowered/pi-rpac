@@ -210,7 +210,7 @@ test("full two-task flow: repeated non-sequential /rpac act through done", async
 	// consolidate
 	const con = await rpacCmd(m, repo, "consolidate");
 	assert.equal(state().phase, "consolidate");
-	assert.match(con.ui.text("info").join("\n"), /consolidate directive issued/);
+	assert.match(con.ui.text("info").join("\n"), /check the overall result and write the report/);
 	assert.match(m.userMessages.at(-1)!, /RPAC · CONSOLIDATE/);
 
 	writeArtifact(repo, "report", "# Completion report\n## Verdict\nComplete — AC-1 verified.\n", firstId);
@@ -482,7 +482,8 @@ test("concurrent ACT refusal: a live lease blocks /rpac act", async () => {
 	await rpacTool(m, repo, { action: "plan_complete", tasks: [{ title: "a" }] }, { confirm: [true] });
 
 	const act1 = await rpacCmd(m, repo, "act");
-	assert.match(act1.ui.text("info").join("\n"), /execution lease held/);
+	assert.match(act1.ui.text("info").join("\n"), /starting the approved task/);
+	assert.ok(existsSync(join(repo, ".pi", "rpac", ".act-lease")), "execution lease held");
 	// a second act while the first model run is still going (no settle) must refuse
 	const act2 = await rpacCmd(m, repo, "act");
 	assert.match(act2.ui.text("error").join("\n"), /already being executed by this Pi session/);
@@ -615,7 +616,7 @@ test("stale artifact + git divergence are reported on act and resume", async () 
 	assert.match(res.ui.text("warning").join("\n"), /requirements artifact changed/);
 	// RPAC's own state churn is NOT reported as git divergence
 	const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
-	const st = await rpacCmd(m, repo, "status");
+	const st = await rpacCmd(m, repo, "status --details");
 	const gitLine = st.ui.text().join("\n").split("\n").find((l) => l.startsWith("Git:"));
 	assert.ok(gitLine, "git line present");
 	assert.ok(gitLine.includes(base.slice(0, 8)));

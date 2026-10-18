@@ -86,12 +86,13 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 	let packageDir: string;
 	let client: RpcClient;
 	let mock: { server: Server; port: number };
+	const requests: any[][] = [];
 
 	before(async () => {
 		mock = await startWorkflowMockModel(CONTENT, (which) => {
 			const index = JSON.parse(readFileSync(join(repo, ".pi", "rpac", "state.json"), "utf8"));
 			return join(repo, ".pi", "rpac", index.active, `${which}.md`);
-		});
+		}, (messages) => requests.push(messages));
 		repo = makeSampleRepo();
 		agentDir = mkdtempSync(join(tmpdir(), "rpac-e2e-agent-"));
 		packageDir = mkdtempSync(join(tmpdir(), "rpac-e2e-package-"));
@@ -142,6 +143,15 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 		},
 	);
 
+	it("style commands dispatch in installed Pi without starting a workflow", { timeout: 60_000 }, async () => {
+		for (const id of ["natural", "chill", "critical-natural", "teacher", "eli5", "technical"]) {
+			const response = await cmd(`/rpac style ${id} --project`);
+			assert.equal(response.success, true);
+			assert.equal(JSON.parse(readFileSync(join(repo, ".pi", "rpac-style.json"), "utf8")).style, id);
+		}
+		assert.equal(existsSync(join(repo, ".pi", "rpac", "state.json")), false);
+	});
+
 	it(
 		"REFINE: start creates the per-workflow state; the model writes requirements and requests approval",
 		{ timeout: 180_000 },
@@ -159,6 +169,14 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 			await settle();
 			const req = readFileSync(join(repo, ".pi", "rpac", s.id, "requirements.md"), "utf8");
 			assert.match(req, /greet\(name\)/);
+			const styleRequests = requests.filter((messages) => JSON.stringify(messages).includes("RPAC communication preference"));
+			assert.ok(styleRequests.length >= 2, "context preference reaches real provider on tool rounds");
+			for (const messages of styleRequests) {
+				assert.equal((JSON.stringify(messages).match(/RPAC communication preference/g) ?? []).length, 1, "one authoritative request-local preference");
+				assert.match(JSON.stringify(messages), /preference — technical/);
+				assert.equal(messages[0].role, "system", "Pi system prompt remains first");
+				assert.ok(!JSON.stringify(messages[0]).includes("RPAC communication preference"), "style is not promoted into system instructions");
+			}
 			const s2 = wf();
 			assert.equal(s2.approvals.requirements, true, "refine_complete approval recorded");
 			assert.equal(s2.phase, "plan", "approval moved the phase to plan");
@@ -170,9 +188,17 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 		"PLAN: the model writes the plan and registers the task list",
 		{ timeout: 180_000 },
 		async () => {
+			const before = readFileSync(wfFile(), "utf8");
+			await cmd("/rpac style chill");
+			assert.equal(readFileSync(wfFile(), "utf8"), before, "style switching does not mutate approvals or progress");
+			const requestStart = requests.length;
 			const r = await cmd("/rpac plan");
 			assert.equal(r.success, true);
 			await settle();
+			for (const messages of requests.slice(requestStart)) {
+				assert.match(JSON.stringify(messages), /preference — chill/);
+				assert.ok(!JSON.stringify(messages).includes("preference — technical"), "old style is not retained in transcript");
+			}
 			const s = wf();
 			const plan = readFileSync(join(repo, ".pi", "rpac", s.id, "plan.md"), "utf8");
 			assert.match(plan, /## Tasks/);
@@ -221,6 +247,7 @@ describe("e2e: complete RPAC workflow through the real Pi binary (RPC)", { skip:
 			assert.match(report, /Completion report/);
 			const s = wf();
 			assert.equal(s.phase, "done", "consolidate_complete → done");
+			assert.ok(!JSON.stringify(requests.at(-1)).includes("RPAC communication preference"), "terminal workflow removes request-local style");
 		},
 	);
 

@@ -20,6 +20,9 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { resolveStyle, stylePaths, parseStyleCommand, saveStylePreference, styleReport, styleCompletions, styleInstruction } from "../lib/styles.ts";
+import { progressMessage, statusOpening, humanError, approvalExplanation } from "../lib/presentation.ts";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -208,7 +211,7 @@ function clearUI(ui: UiMin): void {
 
 function fail(ui: UiMin, err: unknown, fallback: string): void {
 	const msg = err instanceof Error ? err.message : fallback;
-	ui.notify(`RPAC: ${msg}`, "error");
+	ui.notify(`RPAC: ${humanError(msg)}`, "error");
 }
 
 function reportNotes(ui: UiMin, notes: string[]): void {
@@ -216,7 +219,7 @@ function reportNotes(ui: UiMin, notes: string[]): void {
 }
 
 /** Format a full status report (used by /rpac and /rpac status). */
-function statusReport(root: string): string {
+function statusReport(root: string, details = false): string {
 	const { index, state, notes } = loadActive(root, root);
 	const lines: string[] = [];
 	lines.push(`RPAC state: .pi/rpac/ (project root ${root})`);
@@ -232,9 +235,12 @@ function statusReport(root: string): string {
 		}
 		return lines.join("\n");
 	}
+	const style = resolveStyle(stylePaths(getAgentDir(), root)).style;
+	details ||= style.id === "technical";
+	lines.unshift(statusOpening(state, style.id));
 	lines.push(`Active workflow ${state.id} — ${state.workflowKind}${state.review ? ` (${state.review.mode})` : ""} — ${state.task}`);
 	lines.push(
-		`Phase: ${state.phase}${state.paused ? " (PAUSED)" : ""}   Approvals: req=${state.approvals.requirements ? "✓" : "·"} plan=${state.approvals.plan ? "✓" : "·"} sequential=${state.approvals.sequential ? "✓" : "·"}`,
+		`Phase: ${state.phase}${state.paused ? " (PAUSED)" : ""}   Approvals: requirements ${state.approvals.requirements ? "approved" : "not yet approved"}; plan ${state.approvals.plan ? "approved" : "not yet approved"}; multiple tasks per run ${state.approvals.sequential ? "allowed" : "off"}`,
 	);
 	const done = state.tasks.filter((t) => t.status === "done").length;
 	if (state.tasks.length > 0) {
@@ -250,6 +256,7 @@ function statusReport(root: string): string {
 			const issue = t.issues?.length ? `  ⚠ ${t.issues.join("; ")}` : "";
 			lines.push(`  ${mark} ${t.id}. [${t.status}] ${t.title}${issue}`);
 			for (const artifact of t.deliverables ?? []) lines.push(`      deliverable → ${artifact.path} (${artifact.sha256.slice(0, 8)}…)`);
+			if (details) for (const check of t.verification ?? []) lines.push(`      check: ${check.kind ?? "acceptance"} ${check.name} — ${check.result}${check.detail ? `: ${check.detail}` : ""}`);
 		}
 	}
 	for (const key of ["requirements", "plan", "report", "handoff", "reviewManifest"] as const) {
@@ -292,6 +299,17 @@ function statusReport(root: string): string {
 	const others = Object.values(index.workflows).filter((w) => w.id !== state.id);
 	if (others.length > 0) {
 		lines.push(`Other saved workflows: ${others.map((w) => `${w.id} (${w.phase})`).join(", ")} — /rpac list`);
+	}
+	if (!details && style.id !== "technical") {
+		const compact = lines.filter((line) => !/^(RPAC state:|Artifact:|Recent:|  \d{4}-|ACT lease:|Git:|PR scope:|Review:|      deliverable)/.test(line));
+		const gitWarning = lines.find((line) => line.startsWith("Git:") && !/working tree matches baseline|only RPAC state files/.test(line));
+		if (gitWarning) compact.push(gitWarning);
+		if (state.review) {
+			const coverage = reviewCoverage(state);
+			compact.push(`Review coverage: ${coverage.covered}/${coverage.total} items checked; ${coverage.uncovered.length} still uncovered.${state.review.drift ? " Files changed during review (drift); affected results need another look. This is not a clean review." : ""}`);
+		}
+		compact.push(`Saved evidence: .pi/rpac/${state.id}/ — full diagnostics: /rpac status --details`);
+		return compact.join("\n");
 	}
 	return lines.join("\n");
 }
@@ -720,6 +738,16 @@ function isPrReview(state: RpacState): boolean {
 }
 
 export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGhRunner): void {
+	let completionRoot = rootOf(process.cwd());
+	const preferences = (root: string) => resolveStyle(stylePaths(getAgentDir(), root));
+	const progress = (root: string, phase: "refine" | "plan" | "act" | "consolidate") => progressMessage(phase, preferences(root).style.id);
+	const shownPreferenceNotes = new Set<string>();
+	const notePreferences = (ui: UiMin, notes: string[]) => {
+		for (const note of notes) if (!shownPreferenceNotes.has(note)) {
+			ui.notify(`RPAC: ${note}`, "warning");
+			shownPreferenceNotes.add(note);
+		}
+	};
 	// Queue a phase directive as a follow-up user message; works whether or not
 	// the agent is currently streaming.
 	const issueDirective = (text: string): void => {
@@ -773,6 +801,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		"consolidate",
 		"approve",
 		"status",
+		"style",
 		"list",
 		"resume",
 		"accept",
@@ -791,7 +820,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		"act": "execute the next approved task (flags: --sequential, task id)",
 		"consolidate": "issue the consolidate directive (--force for unfinished tasks / non-act phases)",
 		"approve": "approve: /rpac approve requirements|plan|sequential",
-		"status": "show workflow state",
+		"status": "show workflow progress (/rpac status --details for technical evidence)",
+		"style": "choose communication: /rpac style [name] [--global|--project|--reset-project]",
 		"list": "list saved workflows",
 		"resume": "stale checks + re-issue current phase directive (/rpac resume <id> for another workflow)",
 		"accept": "accept a documented exception: /rpac accept <task-id> <reason> (failed → done)",
@@ -874,7 +904,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			controlLease = false;
 			issueDirective(refineDirective(task, artifactFile(root, state.id, "requirements")));
 			refreshUI(ctx.ui, root);
-			ctx.ui.notify(`RPAC workflow ${state.id} started. Phase: refine. Task: ${task}`, "info");
+			ctx.ui.notify(`RPAC started: ${task}\n${progress(root, "refine")}`, "info");
 		} catch (err) {
 			if (controlLease) releaseLock(root, LEASE_NAME);
 			fail(ctx.ui, err, "start failed");
@@ -1008,7 +1038,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			issueDirective(prRefineDirective(prPromptMeta(prMeta), artifactFile(root, state.id, "requirements"), state.review!.manifest.path));
 			refreshUI(ctx.ui, root);
 			ctx.ui.notify(
-				`RPAC PR review ${state.id} started. PR #${prNumber} (${resolved.state}${prMeta.crossRepository ? ", fork" : ""}); scope: ${snapshot.items.length} file(s); checkout: ${strategy}${stateNote}. Phase: refine.`,
+				`RPAC PR review #${prNumber} started. PR #${prNumber} (${resolved.state}${prMeta.crossRepository ? ", fork" : ""}); ${snapshot.items.length} file(s); checkout: ${strategy}${stateNote}. This is report-only; no fixes or GitHub approval will be made.\n${progress(root, "refine")}`,
 				"info",
 			);
 		} catch (err) {
@@ -1080,7 +1110,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			);
 			refreshUI(ctx.ui, root);
 			ctx.ui.notify(
-				`RPAC review ${state.id} started. Mode: ${mode}; scope: ${snapshot.items.length} item(s). Phase: refine.`,
+				`RPAC review started. Mode: ${mode}; scope: ${snapshot.items.length} item(s). Reviewed files stay read-only.\n${progress(root, "refine")}`,
 				"info",
 			);
 		} catch (err) {
@@ -1111,7 +1141,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			} else {
 				issueDirective(refineDirective(state.task, artifactFile(root, state.id, "requirements"), args || undefined));
 			}
-			ctx.ui.notify("RPAC: refine directive issued.", "info");
+			ctx.ui.notify(progress(root, "refine"), "info");
 		} catch (err) {
 			fail(ctx.ui, err, "refine failed");
 		}
@@ -1139,7 +1169,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				const approved = ctx.hasUI
 					? await ctx.ui.confirm(
 							"RPAC: approve the requirements?",
-							`Requirements document: ${artifactFile(root, state.id, "requirements")}\n\nApprove and move to the PLAN phase?`,
+							`Requirements document: ${artifactFile(root, state.id, "requirements")}\n\n${approvalExplanation("requirements", state.workflowKind === "review")}\n\nApprove and move to planning?`,
 						)
 					: false;
 				if (!approved) {
@@ -1181,7 +1211,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			} else {
 				issueDirective(planDirective(cur.task, artifactFile(root, cur.id, "plan"), artifactFile(root, cur.id, "requirements"), args || undefined));
 			}
-			ctx.ui.notify("RPAC: plan directive issued (requirements approved).", "info");
+			ctx.ui.notify(progress(root, "plan"), "info");
 			refreshUI(ctx.ui, root);
 		} catch (err) {
 			fail(ctx.ui, err, "plan failed");
@@ -1296,7 +1326,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			);
 			directiveIssued = true;
 			refreshUI(ctx.ui, root);
-			ctx.ui.notify(`RPAC: ${result.message} (execution lease held until this run ends)`, "info");
+			ctx.ui.notify(`${progress(root, "act")}\n${result.message}`, "info");
 		} catch (err) {
 			if (leaseAcquired && !directiveIssued) abandonActLease(root);
 			fail(ctx.ui, err, "act failed");
@@ -1364,7 +1394,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					),
 			);
 			refreshUI(ctx.ui, root);
-			ctx.ui.notify("RPAC: consolidate directive issued.", "info");
+			ctx.ui.notify(progress(root, "consolidate"), "info");
 		} catch (err) {
 			if (controlLease) releaseLock(root, LEASE_NAME);
 			fail(ctx.ui, err, "consolidate failed");
@@ -1588,7 +1618,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					issueDirective(resumeDirective(cur.task, cur.phase, stNotes.join("\n") || "Continue per the phase skill.", stateRel));
 			}
 			refreshUI(ctx.ui, root);
-			ctx.ui.notify(`RPAC: resumed workflow ${cur.id} in phase ${cur.phase}.`, "info");
+			ctx.ui.notify(`RPAC resumed workflow ${cur.id}: ${cur.task}\n${statusOpening(cur, preferences(root).style.id)}`, "info");
 		} catch (err) {
 			if (leaseAcquired && !directiveIssued) abandonActLease(root);
 			fail(ctx.ui, err, "resume failed");
@@ -1724,7 +1754,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			releaseLock(root, LEASE_NAME);
 			controlLease = false;
 			clearUI(ctx.ui);
-			ctx.ui.notify("RPAC: all RPAC state removed.", "warning");
+			ctx.ui.notify("RPAC: saved workflow state and reports removed. Source files and communication preferences were not changed.", "warning");
 		} catch (err) {
 			if (controlLease) releaseLock(root, LEASE_NAME);
 			fail(ctx.ui, err, "cleanup failed");
@@ -1879,13 +1909,16 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 
 	pi.registerCommand("rpac", {
 		description:
-			"RPAC workflow: /rpac [start <task>|start preview <pr-number>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|list|resume|accept|pause|abort|pr-cleanup|handoff|cleanup]",
+			"RPAC workflow: /rpac [start <task>|start preview <pr-number>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|style|list|resume|accept|pause|abort|pr-cleanup|handoff|cleanup]",
 		getArgumentCompletions: (prefix) => {
+			const styles = styleCompletions(prefix, preferences(completionRoot).styles);
+			if (styles) return styles.length ? styles : null;
 			const matches = SUBCOMMANDS.filter((s) => s.startsWith(prefix.toLowerCase()));
 			if (matches.length === 0) return null;
 			return matches.map((m) => ({ value: m, label: m, description: SUB_HELP[m] }));
 		},
 		handler: async (args, ctx) => {
+			completionRoot = rootOf(ctx.cwd);
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			const sub = tokens.shift()?.toLowerCase() ?? "";
 			const rest = tokens.join(" ");
@@ -1894,8 +1927,21 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					case "":
 					case "status":
 					case "help":
-						ctx.ui.notify(statusReport(rootOf(ctx.cwd)), "info");
+						if (rest && rest !== "--details") throw new Error("Use /rpac status [--details].");
+						ctx.ui.notify(statusReport(rootOf(ctx.cwd), rest === "--details"), "info");
 						break;
+					case "style": {
+						const paths = stylePaths(getAgentDir(), rootOf(ctx.cwd));
+						const command = parseStyleCommand(rest);
+						if (command.action !== "show") saveStylePreference(paths, command);
+						const result = resolveStyle(paths);
+						reportNotes(ctx.ui, result.notes);
+						const saved = command.action === "set"
+							? `Saved ${command.id} as ${command.scope === "global" ? "your personal default" : "this project's override"}.${command.scope === "global" && result.source === "project override" ? " This project still has an override; use /rpac style --reset-project to inherit the personal default." : ""}\n`
+							: command.action === "reset" ? "Project override removed.\n" : "";
+						ctx.ui.notify(saved + styleReport(result), "info");
+						break;
+					}
 					case "start":
 						await cmdStart(ctx, rest);
 						break;
@@ -1967,6 +2013,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		},
 		what: "requirements" | "plan",
 		stateId: string,
+		review: boolean,
 	): Promise<boolean> {
 		if (ctx.hasUI) {
 			const title = what === "requirements" ? "RPAC: approve the requirements?" : "RPAC: approve the implementation plan?";
@@ -1974,7 +2021,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				what === "requirements"
 					? `Requirements document: .pi/rpac/${stateId}/requirements.md`
 					: `Implementation plan: .pi/rpac/${stateId}/plan.md (with its task list)`;
-			return ctx.ui.confirm(title, `${preview}\n\nApprove and continue the workflow?`);
+			return ctx.ui.confirm(title, `${preview}\n\n${approvalExplanation(what, review)}\n\nApprove and continue the workflow?`);
 		}
 		ctx.ui.notify(`RPAC needs user approval: run /rpac approve ${what} to continue.`, "warning");
 		return false;
@@ -2015,7 +2062,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					const open = state.tasks.filter((t) => t.status !== "done").map((t) => `#${t.id} ${t.status}`).join(", ");
 					const coverage = state.review ? reviewCoverage(state) : null;
 					return textResult(
-						`RPAC state: kind ${state.workflowKind}${state.review ? ` (${state.review.mode})` : ""}; phase ${state.phase}${state.paused ? " (paused)" : ""}; approvals req=${state.approvals.requirements ? "✓" : "·"} plan=${state.approvals.plan ? "✓" : "·"} sequential=${state.approvals.sequential ? "✓" : "·"}; tasks ${done}/${state.tasks.length} done; open: ${open || "—"}; ready: ${readyTasks(state).join(", ") || "—"}${coverage ? `; coverage ${coverage.covered}/${coverage.total}, uncovered ${coverage.uncovered.length}${state.review?.drift ? ", drift detected" : ""}` : ""}; state dir: .pi/rpac/${state.id}/. Full detail: /rpac status.`,
+						`RPAC state: kind ${state.workflowKind}${state.review ? ` (${state.review.mode})` : ""}; phase ${state.phase}${state.paused ? " (paused)" : ""}; approvals req=${state.approvals.requirements ? "✓" : "·"} plan=${state.approvals.plan ? "✓" : "·"} sequential=${state.approvals.sequential ? "✓" : "·"}; tasks ${done}/${state.tasks.length} done; open: ${open || "—"}; ready: ${readyTasks(state).join(", ") || "—"}${coverage ? `; coverage ${coverage.covered}/${coverage.total}, uncovered ${coverage.uncovered.length}${state.review?.drift ? ", drift detected" : ""}` : ""}; state dir: .pi/rpac/${state.id}/. Full detail: /rpac status --details.`,
 						{ action: params.action, phase: state.phase, workflowKind: state.workflowKind },
 					);
 				}
@@ -2177,7 +2224,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				if (needsApproval) {
 					const { state: cur } = loadActive(root, root);
 					if (!cur) throw new RpacStateError("not_found", "state vanished during approval");
-					const approved = await requestApproval(ctx, needsApproval, cur.id);
+					const approved = await requestApproval(ctx, needsApproval, cur.id, cur.workflowKind === "review");
 					if (approved) {
 						const what = needsApproval;
 						const latest = loadActive(root, root).state;
@@ -2210,7 +2257,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					err instanceof RpacLockError || err instanceof RpacStateError || err instanceof RpacGuardError
 						? err.message
 						: (err as Error)?.message ?? "rpac action failed";
-				return textResult(`RPAC error: ${msg}`, { action: params.action, error: true });
+				return textResult(`RPAC error: ${humanError(msg)}`, { action: params.action, error: true, diagnostic: msg });
 			}
 		},
 	});
@@ -2218,6 +2265,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 	// ---- lifecycle ------------------------------------------------------------
 
 	pi.on("session_start", (_event, ctx) => {
+		completionRoot = rootOf(ctx.cwd);
+		notePreferences(ctx.ui, preferences(completionRoot).notes);
 		// Cheap: one locked load + status/footer refresh. Disk state is the
 		// source of truth, so nothing needs to be injected into the model
 		// context here (the tiny per-turn context is added by before_agent_start).
@@ -2260,7 +2309,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			}
 			if (state.workflowKind === "review" || state.phase === "refine" || state.phase === "plan") {
 				const decision = gateToolCall(state, ctx.cwd, event.toolName, event.input as Record<string, unknown> | undefined, root);
-				if (decision) return { block: true, reason: decision.reason };
+				if (decision) return { block: true, reason: humanError(decision.reason) };
 				if (isPrReview(state) && typeof (event.input as Record<string, unknown>)?.command === "string" &&
 					isApprovedReviewCheck(state, (event.input as { command: string }).command)) {
 					assertPrCheckout(root, state.review!.pr!);
@@ -2272,6 +2321,23 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			// Failure to establish review/check provenance must not allow execution.
 			return { block: true, reason: `RPAC cannot safely authorize this tool call: ${(err as Error).message}` };
 		}
+	});
+
+	// Request-local presentation only: context runs before EVERY model call and is
+	// not appended to the session. Re-resolve after compaction, reload and handoff.
+	// Never replace Pi's system prompt or tool declarations.
+	pi.on("context", (event, ctx) => {
+		const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === "rpac-style"));
+		try {
+			const root = rootOf(ctx.cwd);
+			const state = peekActive(root, root);
+			if (state && !state.paused && state.phase !== "done" && state.phase !== "aborted") {
+				const preference = preferences(root);
+				notePreferences(ctx.ui, preference.notes);
+				messages.push({ role: "custom", customType: "rpac-style", content: styleInstruction(preference.style), display: false, timestamp: Date.now() });
+			}
+		} catch { /* no presentation on unreadable state; existing gates still fail closed */ }
+		return { messages };
 	});
 
 	// ---- tiny per-turn phase context (MTP2-style) ------------------------------

@@ -192,6 +192,7 @@ export interface WorkflowMockContent {
 export function startWorkflowMockModel(
 	content: WorkflowMockContent,
 	resolveArtifact: (which: "requirements" | "plan" | "report") => string,
+	observeRequest?: (messages: any[]) => void,
 ): Promise<{ server: Server; port: number }> {
 	const messageText = (m: any): string => {
 		if (typeof m?.content === "string") return m.content;
@@ -217,6 +218,7 @@ export function startWorkflowMockModel(
 				sseRespond(res, "mock-1", "ok");
 				return;
 			}
+			observeRequest?.(messages);
 			let phase: string | null = null;
 			let markerIdx = -1;
 			for (let i = messages.length - 1; i >= 0; i--) {
