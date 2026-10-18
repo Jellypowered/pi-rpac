@@ -188,6 +188,7 @@ Write only `review-report.md` using this compact structure:
 # Review report
 
 ## Outcome
+Short plain-language outcome derived from the evidence, including important limits.
 Reviewed mode/snapshot/fingerprint; finding counts by severity; **scrutiny, not approval**.
 
 ## Scope and coverage

@@ -317,6 +317,11 @@ export function isInternalRpacPath(path: Buffer): boolean {
 	return text === ".pi/rpac" || text.startsWith(".pi/rpac/");
 }
 
+/** Presentation preferences are not review scope; this does NOT make a checkout clean. */
+export function isReviewMetadataPath(path: Buffer): boolean {
+	return isInternalRpacPath(path) || path.equals(Buffer.from(".pi/rpac-style.json"));
+}
+
 function selectStatus(status: StatusEntry[], mode: string): StatusEntry[] {
 	if (mode === "current") return status;
 	return status.filter((entry) => entry.conflicted || (!entry.untracked && entry.xy[0] !== "."));
@@ -326,9 +331,10 @@ function patchPathspecs(excludedPaths: string[]): string[] {
 	return [
 		".",
 		":(top,exclude,literal).pi/rpac",
+		":(top,exclude,literal).pi/rpac-style.json",
 		":(top,exclude,glob).pi/rpac/**",
 		...[...new Set(excludedPaths)]
-			.filter((path) => path.length > 0 && !isInternalRpacPath(Buffer.from(path)))
+			.filter((path) => path.length > 0 && !isReviewMetadataPath(Buffer.from(path)))
 			.map((path) => `:(top,exclude,literal)${path}`),
 	];
 }
@@ -349,11 +355,19 @@ export function captureReviewSnapshot(root: string, mode: string, exclusions: Re
 	const headEntries = unborn
 		? new Map<string, GitEntry>()
 		: parseLsTree(runGitBuffer(resolvedRoot, ["ls-tree", "-r", "-z", "--full-tree", "HEAD"]));
-	const status = parseStatus(runGitBuffer(resolvedRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]));
+	const status = parseStatus(runGitBuffer(resolvedRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])).map((entry) => {
+		// A source renamed INTO preference metadata is still a source deletion.
+		// Excluding the destination must not hide shipping-file changes.
+		if (entry.originalPath && entry.xy.includes("R") && isReviewMetadataPath(entry.path) &&
+			!isInternalRpacPath(entry.path) && !isReviewMetadataPath(entry.originalPath)) {
+			return { ...entry, path: entry.originalPath, originalPath: undefined, xy: entry.xy.replaceAll("R", "D"), change: "deleted" };
+		}
+		return entry;
+	});
 	const exclusionSet = new Set(exclusions.map((entry) => entry.path));
 	const patchExcludedPaths = [...exclusionSet];
 	for (const entry of status) {
-		if ((isInternalRpacPath(entry.path) || exclusionSet.has(displayPath(entry.path))) && entry.originalPath) {
+		if ((isReviewMetadataPath(entry.path) || exclusionSet.has(displayPath(entry.path))) && entry.originalPath) {
 			patchExcludedPaths.push(displayPath(entry.originalPath));
 		}
 	}
@@ -391,7 +405,7 @@ export function captureReviewSnapshot(root: string, mode: string, exclusions: Re
 	const blobCache = new Map<string, { sha256: string; size: number; binary: boolean; large: boolean }>();
 	const items: ReviewManifestItem[] = [];
 	for (const entry of [...selected.values()].sort((a, b) => Buffer.compare(a.path, b.path))) {
-		if (isInternalRpacPath(entry.path)) continue;
+		if (isReviewMetadataPath(entry.path)) continue;
 		const path = displayPath(entry.path);
 		if (exclusionSet.has(path)) continue;
 		const key = pathKey(entry.path);

@@ -47,7 +47,7 @@ discussed" or "see above".
 # Requirements — <task>
 
 ## Context
-1–3 sentences: what this work is, what's in scope, what's out.
+1–3 plain-language sentences: what this work is, what's in scope, what's out. Keep the detailed facts and criteria below.
 
 ## Verified codebase facts
 Facts confirmed while validating (where relevant code lives, data shapes, existing analogues),

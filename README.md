@@ -195,14 +195,142 @@ individual resources.
 
 ## Configuration
 
-RPAC has **no required configuration** and intentionally reads no `conf` file — behavior is
-driven by your repository (AGENTS.md, project docs, test toolchain).
+RPAC has **no required configuration**. Workflow behavior is driven by your repository
+(AGENTS.md, project docs, test toolchain). Communication preferences are optional:
 Timing constants are fixed in `lib/lock.ts`: a dead state-lock holder is reclaimed immediately,
 and an ordinary state lock older than **30 s** is recoverable (`LOCK_STALE_MS_DEFAULT`) because
 those critical sections are synchronous and short. The ACT execution lease is taken over only
 when its holder process is provably dead; age alone never displaces a live ACT executor.
 
 There is no separate provider/model configuration — RPAC uses whatever model Pi is running.
+
+### Communication styles
+
+Styles change **how RPAC explains its work**, not what it may do. Approvals, permissions,
+security gates, failed checks and saved technical evidence stay the same.
+
+| Identifier | Voice |
+|---|---|
+| `natural` (default) | Friendly, professional, conversational plain English. |
+| `chill` | Relaxed, casual and concise; no jokes about serious failures. |
+| `critical-natural` | Direct and skeptical; confirmed problems are distinct from suspicions. |
+| `teacher` | Patient explanations of unfamiliar ideas and why important steps matter. |
+| `technical` | Precise engineering terms and relevant commands and diagnostics. |
+| `eli5` | Short sentences and familiar words, without childish language. |
+
+```text
+/rpac style                         # effective style, source, and available names
+/rpac style teacher --global        # your personal default
+/rpac style technical --project     # this project's override
+/rpac style chill                   # shorthand for --project
+/rpac style --reset-project         # remove the override; inherit your personal default
+/rpac status --details              # technical evidence, regardless of style
+```
+
+**Precedence:** project override → personal default → Natural. Changing the personal default
+leaves project overrides in place. Flags may appear before or after the name; unknown flags and
+conflicting scopes are rejected. Tab completion offers built-in/custom identifiers and flags
+where Pi supports it.
+
+**Files:** preferences use version-1 JSON, separate from workflow records:
+
+- Personal: `<agent-dir>/rpac-style.json`, normally `~/.pi/agent/rpac-style.json`.
+  RPAC uses Pi's exported `getAgentDir()`, including `PI_CODING_AGENT_DIR` overrides.
+- Project: `<project-root>/.pi/rpac-style.json`. The root is the Git root, or the current
+  directory outside Git, just like workflow state.
+
+The next relevant model request uses the current preference without restarting work, changing
+approvals or rewriting old reports. Words already streaming cannot change retroactively.
+Preferences survive restarts, reloads, session changes, compaction, resumption and handoffs.
+Style commands work without a workflow, but personality instructions apply **only during an
+active RPAC workflow**—not while paused, completed or aborted. Normal conversations without
+an active workflow are unchanged. Resumption uses the current preference, not a historical copy.
+
+### Custom styles
+
+Edit either preference file. For example, to register and select a personal custom style:
+
+```json
+{
+  "version": 1,
+  "style": "concise-reviewer",
+  "styles": {
+    "concise-reviewer": {
+      "name": "Concise Reviewer",
+      "description": "Short, direct, evidence-focused explanations.",
+      "instructions": "Use short paragraphs, prioritize confirmed issues, explain risks plainly, and avoid unnecessary commentary.",
+      "examples": ["Two confirmed issues need attention before we continue."]
+    }
+  }
+}
+```
+
+Then use `/rpac style concise-reviewer --global` (or `--project` for a project selection).
+`style` and `styles` are optional; `version: 1` is required. A global default can select only
+built-ins or globally defined custom styles; projects can also select project definitions.
+Built-in identifiers cannot be redefined. Project definitions duplicating global identifiers
+are ignored with a warning, never silently substituted.
+
+Custom styles control **model-generated communication**. Extension-generated milestone
+notifications fall back to Natural for custom styles, and status uses shared plain-language wording.
+Custom instructions do not rewrite those deterministic messages. Built-in styles have their own
+milestone wording; no extra model calls are made to restyle notifications.
+
+To **update** a voice, edit its instructions; the next request uses the change without `/reload`.
+To **remove** it, choose another style (or remove its `style` selection), then delete its entry
+from `styles`. Resetting the project override preserves definitions. Unavailable selections
+fall back to the next valid preference with a warning.
+
+Identifiers are lowercase letters/numbers separated by single hyphens, start with a letter and
+have at most 48 characters; reserved identifiers are rejected. Each file allows 32 custom styles
+and 64 KiB total. Limits: name 80 characters, description 240, instructions 1,600; optional
+examples are at most three strings of 240 characters each. Unknown fields, unsupported versions,
+control characters and malformed values are rejected. Configuration is **text only**—no scripts,
+imports or file references. Treat repository-supplied style text as untrusted presentation data,
+never authorization to run commands or change policy.
+
+Writes are atomic. Malformed files are preserved, not overwritten; RPAC explains which file to
+fix or move aside and uses the next valid layer. Symlinked files and write directories are
+refused. Fix invalid files before retrying a save or reset. `/rpac style` shows warnings;
+active requests also surface them once per extension runtime, not on every tool call.
+
+### Progress, approvals and technical evidence
+
+RPAC explains meaningful milestones, complications and next steps instead of narrating every
+tool. Approval dialogs explain what you are agreeing to and point to the document. You can
+decline and ask for changes; approval remains user-only. Errors keep useful diagnostics and
+give recovery guidance where the current state supports it. Failures and limitations stay visible.
+
+`/rpac` and `/rpac status` give the same conversational summary: what is happening, how much
+work is finished, what needs attention and what to do next. Workflow identifiers, hashes,
+internal approval flags and routine file paths are left out. Failed or blocked work, unavailable
+checks, accepted exceptions, changed evidence and review limitations stay visible. Review task
+completion and recorded item coverage are reported separately: finishing tasks never proves a
+complete or successful review. PR restoration/cleanup guidance remains available even after the
+workflow finishes or is stopped; safety-critical commands or recovery paths may appear when needed.
+
+`/rpac status --details` is available in every style. It shows workflow identity, exact task and
+approval states, recorded check results, artifact paths and full identities, Git baseline,
+review coverage and uncovered items, approved review commands, recent events and PR checkout/
+restoration details. Technical style keeps this detailed view by default. Status reads saved
+results; it does not rerun tests or recheck the review snapshot. Full evidence and history remain
+in `.pi/rpac/<workflow-id>/workflow.json`, `log.md`, requirements, plans, reports and review
+ledgers. New documents have a readable opening without replacing required sections.
+Historical artifacts are never restyled.
+
+The exact `.pi/rpac-style.json` file is excluded from local and PR review scope, so changing
+voice does not invalidate review coverage. In-place PR evidence checks also disregard this
+metadata-only change. Checkout preparation and worktree removal retain their strict cleanliness
+rules; no source-file or source-rename exception is added.
+
+**Limitations:** the model controls its wording. RPAC supplies concise, request-local, user-level
+preferences, not a replacement system prompt or an output-rewriting filter. Higher-priority
+instructions and explicit user requests take precedence. Custom text cannot configure tools,
+workflow policy or permissions; existing mechanical gates remain authoritative. This is not a
+general prompt-injection sandbox. Some models may follow a voice imperfectly. Deterministic
+messages vary at useful milestones, not every diagnostic. Passing tests proves instruction
+contracts and gates, not conversational quality for every model. See the
+[six-style comparison and manual checklist](test/manual/styles.md).
 
 ---
 
@@ -367,6 +495,9 @@ status`, `/rpac help`) to see the current state and available actions.
 | Command | What it does |
 |---|---|
 | `/rpac` | Show current workflow state and available actions. |
+| `/rpac style [name] [--global\|--project]` | Show styles or save a preference (project scope by default). |
+| `/rpac style --reset-project` | Remove the project override and inherit the personal default. |
+| `/rpac status --details` | Show detailed technical evidence in any style. |
 | `/rpac start [--yes] <task>` | Start a new implementation workflow. A non-terminal active workflow becomes a *saved* (resumable) workflow rather than being destroyed; headless replacement requires `--yes`. Captures a git baseline and issues the **refine** directive. |
 | `/rpac review [current\|staged\|full]` | Start an approval-gated, report-only review (default: `current`). Requires a Git work tree; unsupported modes/options/base syntax are rejected. Uses the same active-workflow save/confirm safeguards as `start`. |
 | `/rpac start preview <pr-number>` | Start a report-only **GitHub PR review**: resolve the PR with `gh`, safely check out its head (in-place if the tree is clean, isolated worktree if dirty), capture the `base...head` scope, and issue the PR **refine** directive. Requires `gh` (authenticated), a Git work tree, and a remote pointing at the PR's GitHub host. Never posts/merges/comments on GitHub. |
@@ -494,8 +625,8 @@ workflow never destroys an old one.
   .pi/rpac/
   ```
 
-  Omit that rule to version-control workflow state for team handoff. RPAC writes only inside
-  `.pi/rpac/`.
+  Omit that rule to version-control workflow state for team handoff. Workflow writes stay inside `.pi/rpac/`; optional communication
+  preferences use the separate files described under Configuration.
 
 State is a *recoverable source of truth*, not a substitute for checking the repo: on
 `/rpac resume` and `/rpac act`, RPAC re-hashes the artifacts and compares the git tree against the
