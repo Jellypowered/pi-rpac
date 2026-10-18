@@ -145,9 +145,10 @@ test("status summaries preserve failures; detailed and Technical status expose e
 	state.tasks = [{ id: 1, title: "Validate ports", status: "failed", issues: ["npm test failed: exit 1"], verification: [{ name: "npm test", result: "fail", detail: "exit 1: invalid port accepted" }] }];
 	createWorkflow(root, state, true);
 	const plain = (await rpacCmd(m, root, "status")).ui.text("info").join("\n");
-	assert.match(plain, /failed verification; they are not done/);
+	assert.match(plain, /task failed and is not complete/);
 	assert.match(plain, /\/rpac act 1/);
-	assert.match(plain, /npm test failed: exit 1/);
+	assert.match(plain, /1 recorded check failed/);
+	assert.ok(!plain.includes("exit 1"), "raw check output is reserved for details");
 	assert.match(plain, /\/rpac status --details/);
 	assert.ok(!plain.includes("Recent:"));
 	const detailed = (await rpacCmd(m, root, "status --details")).ui.text("info").join("\n");

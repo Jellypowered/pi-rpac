@@ -22,7 +22,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveStyle, stylePaths, parseStyleCommand, saveStylePreference, styleReport, styleCompletions, styleInstruction } from "../lib/styles.ts";
-import { progressMessage, statusOpening, humanError, approvalExplanation } from "../lib/presentation.ts";
+import { progressMessage, statusOpening, nextStep, conversationalStatus, humanError, approvalExplanation } from "../lib/presentation.ts";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -218,9 +218,31 @@ function reportNotes(ui: UiMin, notes: string[]): void {
 	for (const n of notes) ui.notify(`RPAC: ${n}`, "warning");
 }
 
-/** Format a full status report (used by /rpac and /rpac status). */
+/** Shared command path, with independently composed conversational and technical views. */
 function statusReport(root: string, details = false): string {
 	const { index, state, notes } = loadActive(root, root);
+	const style = resolveStyle(stylePaths(getAgentDir(), root)).style;
+	details ||= style.id === "technical";
+	if (!details) {
+		const paragraphs = state ? [conversationalStatus(state, style.id)] : ["No active workflow."];
+		if (!state) {
+			paragraphs.push(Object.keys(index.workflows).length
+				? "There is saved work to inspect with /rpac list. To begin new work, use /rpac start <task description>."
+				: "Start with /rpac start <task description>.");
+		} else {
+			const stale = stalenessNotes(root, state);
+			if (stale.some((note) => !note.startsWith("git:"))) paragraphs.push("Some saved documents or task outputs can no longer be trusted as recorded. Check the details before continuing.");
+			if (stale.some((note) => note.startsWith("git:") && !note.includes("only RPAC state files"))) paragraphs.push("The project has changed since this workflow began, or its starting point can no longer be checked. Review the differences before relying on earlier results.");
+			const pr = state.review?.pr;
+			if (pr) paragraphs.push(pr.checkoutStrategy === "in-place"
+				? `This pull-request review used your main working copy. RPAC does not automatically switch it back. When you are finished, inspect any new work before returning with \`${prRestoreCommand(pr)}\`; RPAC will not discard your changes for you.`
+				: "This pull-request review used a separate copy of the project; your main working copy was not changed. If that copy still exists, run /rpac pr-cleanup when you are finished. Cleanup refuses if files changed or it cannot confirm the copy belongs to RPAC.");
+		}
+		// Recovery/corruption notices may contain paths needed to recover saved work.
+		for (const note of notes) paragraphs.push(`Attention: ${note}`);
+		paragraphs.push("Use /rpac status --details for exact tasks, checks and technical evidence.");
+		return paragraphs.join("\n\n");
+	}
 	const lines: string[] = [];
 	lines.push(`RPAC state: .pi/rpac/ (project root ${root})`);
 	for (const n of notes) lines.push(`Note: ${n}`);
@@ -229,15 +251,13 @@ function statusReport(root: string, details = false): string {
 		if (others.length > 0) {
 			lines.push("No active workflow. Saved workflows:");
 			for (const w of others.slice(0, 10)) lines.push(`  ${w.id} — ${w.phase} — ${w.task} (${w.updatedAt})`);
-			lines.push(`Resume one with:  /rpac resume <id>   (list: /rpac list)`);
+			lines.push("Inspect saved work with /rpac list. Start new work with /rpac start <task description>.");
 		} else {
 			lines.push("No active workflow. Start one with:  /rpac start <task description>");
 		}
 		return lines.join("\n");
 	}
-	const style = resolveStyle(stylePaths(getAgentDir(), root)).style;
-	details ||= style.id === "technical";
-	lines.unshift(statusOpening(state, style.id));
+	lines.unshift(`Next: ${nextStep(state)}`);
 	lines.push(`Active workflow ${state.id} — ${state.workflowKind}${state.review ? ` (${state.review.mode})` : ""} — ${state.task}`);
 	lines.push(
 		`Phase: ${state.phase}${state.paused ? " (PAUSED)" : ""}   Approvals: requirements ${state.approvals.requirements ? "approved" : "not yet approved"}; plan ${state.approvals.plan ? "approved" : "not yet approved"}; multiple tasks per run ${state.approvals.sequential ? "allowed" : "off"}`,
@@ -255,37 +275,37 @@ function statusReport(root: string, details = false): string {
 					: "·";
 			const issue = t.issues?.length ? `  ⚠ ${t.issues.join("; ")}` : "";
 			lines.push(`  ${mark} ${t.id}. [${t.status}] ${t.title}${issue}`);
-			for (const artifact of t.deliverables ?? []) lines.push(`      deliverable → ${artifact.path} (${artifact.sha256.slice(0, 8)}…)`);
+			for (const artifact of t.deliverables ?? []) lines.push(`      deliverable → ${artifact.path} (${artifact.sha256})`);
 			if (details) for (const check of t.verification ?? []) lines.push(`      check: ${check.kind ?? "acceptance"} ${check.name} — ${check.result}${check.detail ? `: ${check.detail}` : ""}`);
 		}
 	}
 	for (const key of ["requirements", "plan", "report", "handoff", "reviewManifest"] as const) {
 		const art = state.artifacts[key];
-		if (art) lines.push(`Artifact: ${key} → ${art.path} (${art.sha256.slice(0, 8)}…)`);
+		if (art) lines.push(`Artifact: ${key} → ${art.path} (${art.sha256})`);
 	}
 	if (state.review) {
 		const coverage = reviewCoverage(state);
 		lines.push(
-			`Review: ${state.review.mode} on ${state.review.head.slice(0, 12)}; fingerprint ${state.review.fingerprint.slice(0, 12)}…; coverage ${coverage.covered}/${coverage.total}; uncovered ${coverage.uncovered.length}${state.review.drift ? "; DRIFT DETECTED" : ""}`,
+			`Review: ${state.review.mode} on ${state.review.head}; fingerprint ${state.review.fingerprint}; coverage ${coverage.covered}/${coverage.total}; uncovered ${coverage.uncovered.length}${state.review.drift ? "; DRIFT DETECTED" : ""}`,
 		);
+		if (coverage.uncovered.length) lines.push(`Uncovered review items: ${coverage.uncovered.join(", ")}`);
+		for (const check of state.review.approvedChecks) lines.push(`Approved review check: ${check}`);
 		if (state.review.pr) {
 			const pr = state.review.pr;
 			lines.push(`PR: #${pr.number} ${pr.url} (${pr.state}${pr.crossRepository ? ", fork" : ""})`);
-			lines.push(`PR scope: base ${pr.baseRef} @ ${pr.baseSha.slice(0, 8)} → head ${pr.headRef} @ ${pr.headSha.slice(0, 8)}; repo ${pr.repository}`);
+			lines.push(`PR scope: base ${pr.baseRef} @ ${pr.baseSha} → head ${pr.headRef} @ ${pr.headSha}; repo ${pr.repository}`);
 			lines.push(`PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}`);
-			if (state.phase !== "done" && state.phase !== "aborted") {
-				if (pr.checkoutStrategy === "in-place") {
-					lines.push(`PR restore: to return to the pre-review branch run \`${prRestoreCommand(pr)}\` (original HEAD ${pr.originalHead.slice(0, 8)}). RPAC never auto-restores (it could overwrite new work).`);
-				} else {
-					lines.push(`PR cleanup: remove the isolated worktree with \`/rpac pr-cleanup\` (refuses dirty, unowned, or changed worktrees). The main worktree was not touched.`);
-				}
+			if (pr.checkoutStrategy === "in-place") {
+				lines.push(`PR restore: when finished, inspect new work before returning to the pre-review branch with \`${prRestoreCommand(pr)}\` (original HEAD ${pr.originalHead}). RPAC never auto-restores (it could overwrite new work).`);
+			} else {
+				lines.push(`PR cleanup: if the isolated worktree still exists, remove it when finished with \`/rpac pr-cleanup\` (refuses dirty, unowned, or changed worktrees). The main worktree was not touched.`);
 			}
 		}
 	}
 	for (const note of stalenessNotes(root, state).filter((n) => !n.startsWith("git:"))) lines.push(`Stale: ${note}`);
 	if (state.baseline) {
 		const div = detectDivergence(root, state.baseline);
-		lines.push(`Git: ${state.baseline.branch || "(detached)"} @ ${state.baseline.head.slice(0, 8)} (baseline ${state.baseline.dirty.length} dirty) — ${div.summary}`);
+		lines.push(`Git: ${state.baseline.branch || "(detached)"} @ ${state.baseline.head} (baseline ${state.baseline.dirty.length} dirty) — ${div.summary}`);
 	}
 	const lease = readLockRecord(root, LEASE_NAME);
 	if (lease && isPidAlive(lease.pid)) {
@@ -299,17 +319,6 @@ function statusReport(root: string, details = false): string {
 	const others = Object.values(index.workflows).filter((w) => w.id !== state.id);
 	if (others.length > 0) {
 		lines.push(`Other saved workflows: ${others.map((w) => `${w.id} (${w.phase})`).join(", ")} — /rpac list`);
-	}
-	if (!details && style.id !== "technical") {
-		const compact = lines.filter((line) => !/^(RPAC state:|Artifact:|Recent:|  \d{4}-|ACT lease:|Git:|PR scope:|Review:|      deliverable)/.test(line));
-		const gitWarning = lines.find((line) => line.startsWith("Git:") && !/working tree matches baseline|only RPAC state files/.test(line));
-		if (gitWarning) compact.push(gitWarning);
-		if (state.review) {
-			const coverage = reviewCoverage(state);
-			compact.push(`Review coverage: ${coverage.covered}/${coverage.total} items checked; ${coverage.uncovered.length} still uncovered.${state.review.drift ? " Files changed during review (drift); affected results need another look. This is not a clean review." : ""}`);
-		}
-		compact.push(`Saved evidence: .pi/rpac/${state.id}/ — full diagnostics: /rpac status --details`);
-		return compact.join("\n");
 	}
 	return lines.join("\n");
 }

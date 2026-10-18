@@ -1,6 +1,8 @@
 // Human-facing summaries. Machine results, diagnostics and saved evidence stay intact.
 import type { RpacState } from "./schema.ts";
+import { reviewCoverage } from "./machine.ts";
 
+/** Custom voices affect model prose; deterministic milestones use Natural. */
 export function progressMessage(phase: "refine" | "plan" | "act" | "consolidate", style = "natural"): string {
 	const voices: Record<string, string[]> = {
 		natural: ["I'll look into the task and clarify what needs to change. No application files will be changed in this step.", "The requirements are approved. I'll prepare a plan for you to review before implementation.", "I'm starting the approved task. I'll check the result before calling it done.", "I'll check the overall result and write the report, including any problems or limits."],
@@ -32,6 +34,62 @@ export function statusOpening(state: RpacState, style = "natural"): string {
 	const failed = state.tasks.filter((task) => task.status === "failed").length;
 	return `${title}${failed ? ` ${failed} task(s) failed verification; they are not done.` : ""}\n${nextStep(state)}`;
 }
+/** A separate human view, not a filtered copy of the technical status report. */
+export function conversationalStatus(state: RpacState, style = "natural"): string {
+	const review = state.review;
+	const coverage = review ? reviewCoverage(state) : null;
+	const ended = state.phase === "done" || state.phase === "aborted";
+	const phases: Record<string, string> = review
+		? { refine: "working out what to review", plan: "planning the review", act: "working through the review", consolidate: "checking the review evidence", done: "finished with the review workflow", aborted: "no longer working on this review" }
+		: { refine: "clarifying the goal", plan: "preparing the plan", act: "working through the approved plan", consolidate: "checking the overall result", done: "finished with this workflow", aborted: "no longer working on this task" };
+	const heading = state.paused ? "RPAC is paused." : `RPAC is ${phases[state.phase]}.`;
+	const lines = [heading];
+	if (!review) lines.push(`Goal: ${state.task}`);
+	const done = state.tasks.filter((task) => task.status === "done").length;
+	if (state.tasks.length) lines.push(state.tasks.length === 1
+		? (done ? "The task is finished." : "The task is not finished.")
+		: `${done} of ${state.tasks.length} tasks are finished.${done < state.tasks.length ? " The remaining work is not complete." : ""}`);
+	const failed = state.tasks.filter((task) => task.status === "failed").length;
+	const blocked = state.tasks.filter((task) => task.status === "blocked").length;
+	const interrupted = state.tasks.filter((task) => task.status === "interrupted").length;
+	if (failed) lines.push(`${failed} ${failed === 1 ? "task failed and is" : "tasks failed and are"} not complete.`);
+	if (blocked) lines.push(`${blocked} ${blocked === 1 ? "task is" : "tasks are"} blocked and cannot continue yet.`);
+	if (interrupted) lines.push(`${interrupted} ${interrupted === 1 ? "task stopped before finishing and still needs" : "tasks stopped before finishing and still need"} to be checked.`);
+	const checks = state.tasks.flatMap((task) => task.verification ?? []);
+	const failedChecks = checks.filter((check) => check.result === "fail").length;
+	const unavailable = checks.filter((check) => check.result === "unavailable").length;
+	if (failedChecks) lines.push(`${failedChecks} recorded ${failedChecks === 1 ? "check failed" : "checks failed"}.`);
+	if (unavailable) lines.push(`${unavailable} recorded ${unavailable === 1 ? "check is" : "checks are"} unavailable; those results are unverified.`);
+	if (state.tasks.some((task) => task.status === "done" && !task.verification?.length)) lines.push("Some finished tasks have no saved checks, so their results are unverified.");
+	if (state.tasks.some((task) => task.acceptedException)) lines.push("Some tasks were accepted with an exception. That does not mean every check passed.");
+	if (state.tasks.some((task) => task.issues?.length)) lines.push("Read the recorded issues or deviations in the details before relying on the result.");
+	if (coverage) {
+		lines.push(`The saved review evidence covers ${coverage.covered} of ${coverage.total} items.${coverage.uncovered.length ? ` ${coverage.uncovered.length} ${coverage.uncovered.length === 1 ? "item still needs" : "items still need"} review, so the assessment is incomplete.` : ""}`);
+		if (review!.drift) lines.push("The files or review conditions changed, or could not be verified, during the review (review drift). Earlier results cannot be trusted for the affected parts. This is not a clean review.");
+		if (done === state.tasks.length && state.tasks.length) lines.push("Finished review tasks alone do not establish a complete or successful assessment.");
+		lines.push("This is a review, not approval or a guarantee that no problems remain.");
+	}
+	let next = nextStep(state);
+	if (state.phase === "done") next = review ? "Read the saved review results and limitations before relying on them. No fixes or GitHub approval were made by this review." : "Review the saved results before deciding what to do with the changes. RPAC has not committed or published them.";
+	if (coverage && !coverage.complete && ended) {
+		const restart = review!.pr ? `/rpac start preview ${review!.pr.number}` : "/rpac review";
+		next += ` For a new assessment of the remaining work, start another review with ${restart}.`;
+	} else if (!ended && !state.paused && coverage && !coverage.complete && state.tasks.length && done === state.tasks.length && (state.phase === "act" || state.phase === "consolidate")) {
+		next = "Ask the model to revisit the review plan for the missing or changed evidence, or finish with an explicitly incomplete report. Do not treat it as a complete assessment.";
+	} else if (!ended && !state.paused && state.phase === "act" && state.tasks.some((task) => task.status === "in_progress")) {
+		next = "A task is marked as underway. Wait for the current run to finish; if it stopped, use /rpac resume.";
+	} else if (!ended && !state.paused && state.phase === "act" && blocked) {
+		next = "Read the blocker in the details, resolve it, then ask the model to unblock the task before retrying.";
+	}
+	if (!ended && !state.paused && state.phase === "act" && !blocked && !state.tasks.some((task) => task.status === "in_progress")) {
+		const retry = state.tasks.find((task) => task.status === "failed" || task.status === "interrupted");
+		if (retry) next = `Resolve the reported problem, then run /rpac act ${retry.id} to retry the task.`;
+	}
+	if (style === "eli5") next = `Next: ${next}`;
+	lines.push(next);
+	return lines.join("\n\n");
+}
+
 export function humanError(diagnostic: string): string {
 	if (/cannot approve thin|no requirements artifact/.test(diagnostic)) return "The requirements or plan are not ready for approval yet. Ask the model to finish the document first.\n" + diagnostic;
 	if (/changed after it was finalized/.test(diagnostic)) return "The document changed after it was prepared for approval. Please review the updated version; the model must finalize it again before you approve.\n" + diagnostic;

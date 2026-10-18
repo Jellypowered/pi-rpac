@@ -223,7 +223,7 @@ test("full two-task flow: repeated non-sequential /rpac act through done", async
 
 test("status reflects completion and the saved workflow list", async () => {
 	const st = await rpacCmd(m, repo, "status");
-	assert.match(st.ui.text().join("\n"), /Phase: done/);
+	assert.match(st.ui.text().join("\n"), /finished with this workflow/);
 });
 
 test("failed check: task stays failed (not done); unavailable check too", async () => {
@@ -341,7 +341,9 @@ test("sequential execution continues only after a verified pass", async () => {
 	assert.equal(state().tasks[0]!.deliverables?.[0]?.sha256, sha256File(deliverable));
 	writeFileSync(deliverable, "changed after task completion\n", "utf8");
 	const deliverableStatus = await rpacCmd(m, repo, "status");
-	assert.match(deliverableStatus.ui.text("info").at(-1)!, /task 1 deliverable changed/, "status detects stale registered output");
+	assert.match(deliverableStatus.ui.text("info").at(-1)!, /saved documents or task outputs can no longer be trusted/, "status warns about stale registered output");
+	const deliverableDetails = await rpacCmd(m, repo, "status --details");
+	assert.match(deliverableDetails.ui.text("info").at(-1)!, /task 1 deliverable changed/, "details identify the stale output");
 	// the model continues within the run: task 2 starts (simulating the model's next task_start)
 	const s2 = await rpacTool(m, repo, { action: "task_start", task: 2 });
 	assert.match(s2, /Started task 2/);
@@ -649,7 +651,7 @@ test("extension reload + session resume: a fresh runtime sees the same workflow"
 	const wfId = activeWorkflowId(repo);
 	const m2 = makeMockPi();
 	rpacExtension(extensionApiFor(m2));
-	const ctx = await rpacCmd(m2, repo, "status");
+	const ctx = await rpacCmd(m2, repo, "status --details");
 	assert.match(ctx.ui.text().join("\n"), new RegExp(wfId));
 	// session_start refreshes the footer from disk
 	const startHandlers = m2.handlers.get("session_start") ?? [];
@@ -795,7 +797,7 @@ test("/rpac review drives a manifest-backed report-only workflow through resume-
 		assert.ok(existsSync(join(workflowDirPath(reviewRepo, id), "review-manifest.json")));
 		assert.match(reviewPi.userMessages.at(-1)!, /REVIEW REFINE/);
 		assert.match(started.ui.text("info").join("\n"), /scope: .*item/);
-		const status = await rpacCmd(reviewPi, reviewRepo, "status");
+		const status = await rpacCmd(reviewPi, reviewRepo, "status --details");
 		assert.match(status.ui.text("info").join("\n"), /Active workflow .*review \(current\)/);
 		const listed = await rpacCmd(reviewPi, reviewRepo, "list");
 		assert.match(listed.ui.text("info").join("\n"), /review:refine/);

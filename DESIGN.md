@@ -378,7 +378,10 @@ without an active workflow and do not dispatch a model turn or call a workflow t
 Completions use the most recent command/session root, initially Pi's process cwd, since Pi's
 completion callback supplies only the argument prefix, not an extension context.
 
-Built-ins have six distinct voice instructions and milestone variants. Custom styles are validated
+Built-ins have six distinct voice instructions and milestone variants. Custom styles affect
+model-generated communication only: deterministic milestone notifications use the Natural fallback
+in `progressMessage`, and status uses shared plain-language wording. No custom milestone schema,
+output templating or notification-rewriting model call is introduced. Custom styles are validated
 text records (name, description, instructions, optional examples), merged into the registry without
 allowing built-in replacement. Project/global custom collisions warn and retain the global definition.
 Global selections cannot depend on project-only definitions. Unknown selections fall back with a
@@ -428,8 +431,8 @@ this newly reserved metadata path, scope recapture/replanning may be necessary.
 
 | Surface | Presentation / evidence boundary |
 |---|---|
-| `/rpac`, `status`, `help` | Progress and supported next-step opening; readable approval labels. Compact default retains task issues, stale/divergence warnings, PR restoration/cleanup guidance, review coverage/drift. `status --details` retains diagnostics, checks, baseline, events and artifact pointers; Technical keeps detailed status by default. |
-| `start`, `refine`, `plan`, `act`, `consolidate`, `resume` | Plain milestone explanations; six voices where useful. Workflow IDs remain in resume/status/list when needed to select saved work, not every announcement. ACT results/logs remain exact. |
+| `/rpac`, `status`, `help` | A shared command path selects two independently composed views, not a filtered technical dump. Default: conversational phase/progress, counts of failed/blocked/interrupted work and failed/unavailable checks, accepted exceptions, stale/project-change warnings and supported next steps. Review task completion is explicitly separate from saved item coverage and drift; even a terminal workflow cannot imply a complete assessment. No routine workflow IDs, hashes, internal approval flags or metadata paths. Recovery notices and necessary PR restoration commands are exceptions. `status --details` retains exact task/approval states, checks, full artifact/Git/review identities, uncovered IDs, approved review checks, events, paths and PR restoration/cleanup guidance (also for terminal workflows). Technical uses this view by default. Neither view changes state or re-verifies the snapshot. |
+| `start`, `refine`, `plan`, `act`, `consolidate`, `resume` | Plain milestone explanations; six voices where useful. Workflow IDs remain in resume/list and detailed status when needed to select saved work, not every announcement. ACT results/logs remain exact. |
 | Review/PR preview | Explicit report-only boundaries, scope counts and checkout strategy; original PR identities and metadata remain saved. |
 | Approval dialogs and headless notifications | Explain what requirements/plan approval permits and that users may decline; exact artifact pointer and existing confirmation mechanism retained. Sequential/force/replacement warnings remain explicit. |
 | Command/tool errors | Small `humanError` helper adds understandable context/recovery without deleting the original diagnostic. Model tool results also retain `details.diagnostic`; no exception class name is displayed. Unknown cases recommend inspecting status, not a guessed mutating recovery command. |
@@ -453,6 +456,7 @@ this newly reserved metadata path, scope recapture/replanning may be necessary.
 | PR review (`lib/pr.ts`) | temp origin+clone fixtures exposing `refs/pull/N/head`: metadata normalization, `parseNameStatus`, `base...head` snapshot layers, exclusions, in-place vs. worktree checkout (dirty tree preserved), `pr-cleanup`, `verifyGitObjects`, SHA validation, deterministic drift |
 | PR review (e2e) | mock `gh` on PATH (no network/GitHub): command parsing, invalid numbers, missing/unauthenticated gh, non-git/missing remote, fork PRs, dirty-tree worktree + main-tree preservation, existing-workflow safeguards, force-push drift invalidation, resume after restart, report-only gate, and an assertion that no mutating `gh` command is ever attempted |
 | communication configuration | unit: six voices, strict parser/completions, custom registry, global/project precedence/reset, fresh reads, malformed recovery, bounds, links, declarative-only schema and adversarial instruction contract |
+| conversational status | real extension handlers: bare/status consistency, Natural active/incomplete work, failed/blocked/interrupted tasks, paused/done/aborted states, exceptions and unavailable/observation checks, incomplete/drifting/terminal reviews, PR restoration/cleanup, stale evidence, full details/Technical, no-active recovery and documented custom fallback |
 | communication lifecycle | mock-Pi: immediate switching, unchanged workflow/artifact bytes, fresh runtime/session/handoff, empty post-compaction context, active phases vs paused/done/aborted/unreadable state, deduplicated warnings, approvals and failed verification remain enforced |
 | communication in installed Pi | real RPC provider requests: commands select all six built-ins; one user-level preference per active invocation/tool continuation, immediate Technical → Chill switching, system prompt retained, no stale history and no style after terminal completion |
 | review preference isolation | current/staged/full snapshots unchanged by metadata edits; in-place PR lifecycle switching does not invalidate approval/evidence; strict cleanup predicates and source rename refusal retained |

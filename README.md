@@ -271,6 +271,11 @@ built-ins or globally defined custom styles; projects can also select project de
 Built-in identifiers cannot be redefined. Project definitions duplicating global identifiers
 are ignored with a warning, never silently substituted.
 
+Custom styles control **model-generated communication**. Extension-generated milestone
+notifications fall back to Natural for custom styles, and status uses shared plain-language wording.
+Custom instructions do not rewrite those deterministic messages. Built-in styles have their own
+milestone wording; no extra model calls are made to restyle notifications.
+
 To **update** a voice, edit its instructions; the next request uses the change without `/reload`.
 To **remove** it, choose another style (or remove its `style` selection), then delete its entry
 from `styles`. Resetting the project override preserves definitions. Unavailable selections
@@ -296,11 +301,21 @@ tool. Approval dialogs explain what you are agreeing to and point to the documen
 decline and ask for changes; approval remains user-only. Errors keep useful diagnostics and
 give recovery guidance where the current state supports it. Failures and limitations stay visible.
 
-`/rpac status` begins with progress and next-step guidance. `/rpac status --details` shows the
-technical status, recorded checks, Git baseline, recent events and artifact pointers. Technical
-style also keeps detailed status by default. Full identities, exact check details and historical
-records remain in `.pi/rpac/<workflow-id>/workflow.json`, `log.md`, requirements, plans, reports
-and review ledgers. New documents have a readable opening without replacing required sections.
+`/rpac` and `/rpac status` give the same conversational summary: what is happening, how much
+work is finished, what needs attention and what to do next. Workflow identifiers, hashes,
+internal approval flags and routine file paths are left out. Failed or blocked work, unavailable
+checks, accepted exceptions, changed evidence and review limitations stay visible. Review task
+completion and recorded item coverage are reported separately: finishing tasks never proves a
+complete or successful review. PR restoration/cleanup guidance remains available even after the
+workflow finishes or is stopped; safety-critical commands or recovery paths may appear when needed.
+
+`/rpac status --details` is available in every style. It shows workflow identity, exact task and
+approval states, recorded check results, artifact paths and full identities, Git baseline,
+review coverage and uncovered items, approved review commands, recent events and PR checkout/
+restoration details. Technical style keeps this detailed view by default. Status reads saved
+results; it does not rerun tests or recheck the review snapshot. Full evidence and history remain
+in `.pi/rpac/<workflow-id>/workflow.json`, `log.md`, requirements, plans, reports and review
+ledgers. New documents have a readable opening without replacing required sections.
 Historical artifacts are never restyled.
 
 The exact `.pi/rpac-style.json` file is excluded from local and PR review scope, so changing

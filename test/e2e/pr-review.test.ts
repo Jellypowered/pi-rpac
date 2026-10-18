@@ -498,7 +498,7 @@ test("PR review is resumable after restart (state + directive persist)", async (
 		// Simulate a fresh Pi session (new mock runtime, same on-disk state).
 		const m2 = makeMockPi();
 		rpacExtension(extensionApiFor(m2));
-		const status = await rpacCmd(m2, env.work, "status");
+		const status = await rpacCmd(m2, env.work, "status --details");
 		assert.match(status.ui.text("info").join("\n"), /PR: #1 https:\/\/github\.com\/acme\/widget\/pull\/1/);
 		assert.match(status.ui.text("info").join("\n"), /PR checkout: in-place/);
 		const resumed = await rpacCmd(m2, env.work, `resume ${id}`);
