@@ -355,7 +355,7 @@ your original branch with plain Git (the recorded branch/HEAD is shown in `/rpac
 `/rpac pr-cleanup`, which leaves your main tree exactly as it was. Cleanup requires a registered,
 RPAC-owned worktree at the recorded head and refuses tracked changes, untracked/ignored files,
 symlinks, or hidden index flags. It never forces removal or recursively deletes a fallback path.
-Legacy worktrees without an ownership record require manual inspection; RPAC refuses to remove them.
+Legacy worktrees without an ownership record require manual inspection; RPAC refuses to remove them. Cleanup leaves the local `refs/rpac/pr/<number>` fetch ref and fetched objects in the main repository; RPAC does not delete a ref whose ownership cannot be proven. Inspect and remove that ref manually only after confirming its current SHA and that no other workflow uses it.
 
 ---
 

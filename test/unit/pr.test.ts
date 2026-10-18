@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	classifyPrState,
@@ -12,6 +12,7 @@ import {
 	verifyGitObjects,
 	prWorktreePath,
 	assessPrCheckout,
+	cleanPrStatus,
 	performPrCheckout,
 	removePrWorktree,
 	buildPrMeta,
@@ -98,6 +99,38 @@ function viewFor(base: string, head: string, extra: Partial<PrViewResult> = {}):
 		...extra,
 	};
 }
+
+test("porcelain v1 -z renames inspect both paths without stripping bytes", () => {
+	const rec = (first: string, second: string) => Buffer.from(`R  ${first}\0${second}\0`);
+	assert.equal(cleanPrStatus(Buffer.alloc(0)), true);
+	assert.equal(cleanPrStatus(Buffer.from("?? .pi/rpac/state\0")), true);
+	for (const path of ["old", "xyz.pi/rpac/hidden", " x.pi/rpac/hidden", "\n.pi/rpac/hidden"]) {
+		assert.equal(cleanPrStatus(rec(".pi/rpac/state", path)), false, path);
+		assert.equal(cleanPrStatus(rec(path, ".pi/rpac/state")), false, path);
+	}
+	assert.equal(cleanPrStatus(rec(".pi/rpac/new", ".pi/rpac/old")), true);
+	for (const invalid of ["R  .pi/rpac/new\0", "R  .pi/rpac/new", "old\0", "?? .pi/rpac/x\0bare\0", "?? .pi/rpac/x\0\0"]) {
+		assert.equal(cleanPrStatus(Buffer.from(invalid)), false, invalid);
+	}
+});
+
+test("actual Git staged and unstaged rename records cannot bypass clean checkout", () => {
+	const repo = makeTempDir("rpac-rename-");
+	try {
+		git(repo, "init", "-q"); git(repo, "config", "user.email", "x@y"); git(repo, "config", "user.name", "x");
+		mkdirSync(join(repo, "xyz.pi", "rpac"), { recursive: true });
+		writeFileSync(join(repo, "xyz.pi", "rpac", "old"), "original\n");
+		git(repo, "add", "."); git(repo, "commit", "-qm", "initial");
+		mkdirSync(join(repo, ".pi", "rpac"), { recursive: true });
+		git(repo, "mv", "xyz.pi/rpac/old", ".pi/rpac/new");
+		const status = execFileSync("git", ["status", "--porcelain=v1", "-z"], { cwd: repo });
+		assert.equal(status.toString(), "R  .pi/rpac/new\0xyz.pi/rpac/old\0");
+		assert.equal(cleanPrStatus(status), false);
+		assert.equal(assessPrCheckout(repo).clean, false);
+		git(repo, "reset", "-q");
+		assert.equal(assessPrCheckout(repo).clean, false);
+	} finally { removeTree(repo); }
+});
 
 // --- pure metadata helpers -------------------------------------------------
 
@@ -207,7 +240,7 @@ test("compareReviewSnapshots detects PR head drift via item changes", () => {
 		const newHead = git(work, "rev-parse", "HEAD");
 		git(work, "update-ref", "refs/pull/1/head", newHead);
 		const after = capturePrSnapshot(work, baseSha, newHead, 1);
-		const drift = compareReviewSnapshots(before as never, after as never);
+		const drift = compareReviewSnapshots(before, after);
 		assert.equal(drift.unchanged, false);
 		assert.ok(drift.addedItemIds.length > 0 || drift.changedItemIds.length > 0);
 	} finally {

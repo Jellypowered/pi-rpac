@@ -241,6 +241,31 @@ export function selectPrRemote(root: string, pr: ResolvedPr): string {
 	throw new Error(`no remote matches the PR base repository ${host}/${pr.repository}`);
 }
 
+/** Porcelain v1 -z: XY SP path NUL [original-path NUL for R/C]. Both paths matter. */
+export function cleanPrStatus(output: Buffer): boolean {
+	if (!output.length) return true;
+	if (output[output.length - 1] !== 0) return false;
+	const records: Buffer[] = [];
+	let start = 0;
+	for (let i = 0; i < output.length; i++) {
+		if (output[i] === 0) { records.push(output.subarray(start, i)); start = i + 1; }
+	}
+	for (let i = 0; i < records.length; i++) {
+		const record = records[i]!;
+		if (record.length < 4 || record[2] !== 0x20) return false;
+		const x = record[0]!; const y = record[1]!;
+		const valid = (c: number) => c === 0x20 || "MADRCTU".includes(String.fromCharCode(c));
+		if (!((x === 0x3f && y === 0x3f) || (x === 0x21 && y === 0x21) ||
+			(valid(x) && valid(y) && (x !== 0x20 || y !== 0x20)))) return false;
+		if (!isInternalRpacPath(record.subarray(3))) return false;
+		if (x === 0x52 || x === 0x43 || y === 0x52 || y === 0x43) {
+			const original = records[++i];
+			if (!original?.length || !isInternalRpacPath(original)) return false;
+		}
+	}
+	return true;
+}
+
 /** Inspect the repository to decide whether a PR checkout is safe. */
 export function assessPrCheckout(root: string): CheckoutAssessment {
 	const info = gitInfo(root);
@@ -253,8 +278,7 @@ export function assessPrCheckout(root: string): CheckoutAssessment {
 		remote,
 		// Status errors must throw, never masquerade as a clean tree. Ignored files
 		// are local work too: checkout can otherwise overwrite them.
-		clean: !hasHiddenIndexEntries(root) && splitNul(runGitBuffer(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"]))
-			.every(record => isInternalRpacPath(record.subarray(3))),
+		clean: !hasHiddenIndexEntries(root) && cleanPrStatus(runGitBuffer(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"])),
 		dirty: info.dirty,
 	};
 }
@@ -532,8 +556,8 @@ function hasHiddenIndexEntries(location: string): boolean {
 /** Includes ignored files: Git otherwise discards them during worktree removal. */
 function assertCleanCheckout(location: string, allowRpacState = false): void {
 	if (hasHiddenIndexEntries(location)) throw new Error("PR worktree index hides potentially dirty files (assume-unchanged/skip-worktree); refusing cleanup/reuse");
-	const status = splitNul(runGitBuffer(location, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"]));
-	if (status.some(record => !allowRpacState || !isInternalRpacPath(record.subarray(3)))) {
+	const status = runGitBuffer(location, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", "--ignore-submodules=none"]);
+	if (status.length && (!allowRpacState || !cleanPrStatus(status))) {
 		throw new Error("PR worktree has dirty/uncommitted, untracked, or ignored files; preserve them before cleanup/reuse");
 	}
 }
@@ -556,8 +580,8 @@ export function assertPrCheckout(root: string, pr: PrReviewMeta): void {
 	} else if (resolve(pr.checkoutLocation) !== resolve(root)) throw new Error("PR in-place checkout location is invalid");
 	if (runGitText(pr.checkoutLocation, ["rev-parse", "HEAD"]) !== pr.headSha) throw new Error("PR checkout HEAD differs from the reviewed commit");
 	if (hasHiddenIndexEntries(pr.checkoutLocation)) throw new Error("PR checkout index hides potential local changes; verification evidence is untrusted");
-	const status = splitNul(runGitBuffer(pr.checkoutLocation, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]));
-	if (status.some(r => !isInternalRpacPath(r.subarray(3)))) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
+	const status = runGitBuffer(pr.checkoutLocation, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
+	if (!cleanPrStatus(status)) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
 }
 
 /** Re-resolve the current PR head SHA (for force-push / drift detection). */

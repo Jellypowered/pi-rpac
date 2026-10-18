@@ -263,7 +263,7 @@ function statusReport(root: string): string {
 		);
 		if (state.review.pr) {
 			const pr = state.review.pr;
-			lines.push(`PR: #${pr.number} ${pr.url} (${pr.state}${pr.crossRepository ? ", fork" : ""}) — "${pr.title}"`);
+			lines.push(`PR: #${pr.number} ${pr.url} (${pr.state}${pr.crossRepository ? ", fork" : ""})`);
 			lines.push(`PR scope: base ${pr.baseRef} @ ${pr.baseSha.slice(0, 8)} → head ${pr.headRef} @ ${pr.headSha.slice(0, 8)}; repo ${pr.repository}`);
 			lines.push(`PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}`);
 			if (state.phase !== "done" && state.phase !== "aborted") {
@@ -365,7 +365,7 @@ function readPrSnapshot(root: string, state: RpacState): PrReviewSnapshot {
 function captureStablePrSnapshot(root: string, pr: PrReviewMeta, exclusions: ReviewExclusion[]): PrReviewSnapshot {
 	const first = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, exclusions);
 	const second = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, exclusions);
-	if (!compareReviewSnapshots(first as unknown as ReviewSnapshot, second as unknown as ReviewSnapshot).unchanged) {
+	if (!compareReviewSnapshots(first, second).unchanged) {
 		throw new RpacGuardError("the PR refs changed while the snapshot was being captured — retry when stable");
 	}
 	return second;
@@ -387,7 +387,7 @@ function recheckPrSnapshot(root: string, state: RpacState, gh: GhRunner): string
 	try {
 		const before = readPrSnapshot(root, state);
 		const after = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, state.review!.exclusions);
-		const drift = compareReviewSnapshots(before as unknown as ReviewSnapshot, after as unknown as ReviewSnapshot);
+		const drift = compareReviewSnapshots(before, after);
 		fingerprint = after.fingerprint;
 		added = drift.addedItemIds;
 		removed = drift.removedItemIds;
@@ -992,7 +992,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				capturedAt: snapshot.capturedAt,
 				scopeItemIds: snapshot.items.map((item) => item.id),
 				pr: prMeta,
-				task: `PR review #${prNumber} — ${resolved.title}`,
+				task: `PR review #${prNumber}`,
 			});
 			state.baseline = captureBaseline(root);
 			mkdirSync(workflowDir(root, state.id), { recursive: true });
@@ -1801,7 +1801,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			lines.push(`- Review manifest: ${state.review.manifest.path} (${state.review.fingerprint}); coverage ${coverage.covered}/${coverage.total}; uncovered ${coverage.uncovered.length}`);
 			if (state.review.pr) {
 				const pr = state.review.pr;
-				lines.push(`- PR: #${pr.number} ${pr.url} (${pr.state}) — "${pr.title}"; base ${pr.baseRef}@${pr.baseSha.slice(0, 8)} → head ${pr.headRef}@${pr.headSha.slice(0, 8)}`);
+				lines.push(`- PR: #${pr.number} ${pr.url} (${pr.state}); base ${pr.baseRef}@${pr.baseSha.slice(0, 8)} → head ${pr.headRef}@${pr.headSha.slice(0, 8)}`);
 				lines.push(`- PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}${pr.checkoutStrategy === "in-place" ? ` (restore: ${prRestoreCommand(pr)})` : " (cleanup: /rpac pr-cleanup)"}`);
 			}
 		}

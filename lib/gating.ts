@@ -114,7 +114,6 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*git\s+remote(?:\s+-v)?\s*$/i,
 	/^\s*git\s+branch(?:\s+(?:--list|-a|--all|-r|--remotes|--show-current|-v|-vv))*\s*$/i,
 	/^\s*git\s+config\s+--get(?:\s|$)/i,
-	/^\s*git\s+ls-/i,
 	/^\s*(node|deno|bun)\s+(?:-v|--(?:version|help))\s*$/i,
 	/^\s*(python[23]?|ruby|perl|java)\s+--version\b/i,
 	/^\s*docker\s+(ps|inspect|images|version)(?:\s|$)/i,
@@ -249,7 +248,7 @@ function hasDestructiveShellSegment(rawCommand: string): boolean {
 		// Unknown Git global options must not hide mutations from the denylist
 		// (e.g. git --git-dir=... update-ref). Only known read-only Git syntax
 		// may appear directly in an approved project check.
-		if (/^(?:env\s+(?:[A-Z_][A-Z0-9_]*=\S*\s+)*)?git(?:\s|$)/i.test(normalized) && readOnlyCommandIssue(seg) !== null) return true;
+		if (/^git(?:\s|$)/i.test(normalized) && readOnlyCommandIssue(seg) !== null) return true;
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
 			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) return true;
 		}
@@ -280,6 +279,9 @@ function readOnlyCommandIssue(rawCommand: string): string | null {
 				return `a blocked mutating operation appears in segment: ${shortSegment(seg)}`;
 			}
 		}
+		if (/^git(?:\s|$)/i.test(normalized) && /--(?:ext-diff|textconv|exec|output|paginate)\b/i.test(normalized)) {
+			return `Git external execution or output option is blocked: ${shortSegment(seg)}`;
+		}
 		if (!SAFE_PATTERNS.some((pattern) => pattern.test(normalized))) {
 			return `command segment is not on the read-only allowlist: ${shortSegment(seg)}`;
 		}
@@ -301,17 +303,35 @@ export function hasPrCheckDirectory(state: RpacState, command: string): boolean 
 	if (!state.review?.pr) return true;
 	const prefix = prCheckPrefix(state.review.pr.checkoutLocation);
 	if (!command.trim().startsWith(prefix)) return false;
-	const rest = shellSegments(command.trim().slice(prefix.length));
-	// No subsequent shell directory switches. Approved scripts remain trusted code,
-	// not an OS sandbox; approval must account for what those scripts execute.
-	return rest !== null && rest.length > 0 && !rest.some(s => /^cd(?:\s|$)/.test(normalize(s)));
+	const suffix = command.trim().slice(prefix.length);
+	const syntax = shellSyntaxOnly(suffix);
+	const rest = shellSegments(suffix);
+	// Reject nested shells, substitutions, escaping and alternate directory builtins.
+	// The only shell-controlled cwd transition is the pinned prefix above.
+	return syntax !== null && !/[(){}\n\\]/.test(suffix) && !/[(){}$]/.test(syntax) &&
+		rest !== null && rest.length > 0 && !rest.some(s => /^(?:cd|pushd|popd|dirs|env|command|builtin|exec|eval|source|\.|bash|sh|zsh|fish|set|export|npx|python\d*|ruby|perl)(?:\s|$)/i.test(s.trim()) ||
+			/^(?:node|bun|deno)\s+(?:-e|--eval|--print|eval)(?:\s|$)/i.test(s.trim()) ||
+			/^[A-Za-z_][A-Za-z_0-9]*=/.test(s.trim()) || /^git\s+(?:-c|--|-[A-Za-z]|ls-)/i.test(s.trim()));
 }
 
 /** Exact user-approved review checks may exceed the inspection allowlist, but never the destructive denylist. */
 export function isApprovedReviewCheck(state: RpacState, rawCommand: string): boolean {
 	if (state.workflowKind !== "review" || !state.review || !state.approvals.plan) return false;
 	const command = rawCommand.trim();
-	return state.review.approvedChecks.includes(command) && hasPrCheckDirectory(state, command) && !hasDestructiveShellSegment(command);
+	if (!state.review.approvedChecks.includes(command) || !hasPrCheckDirectory(state, command) || hasDestructiveShellSegment(command)) return false;
+	// Approval may authorize a project test runner, but never a Git wrapper,
+	// external Git command, alias, or unrecognized Git subcommand.
+	if (state.review.pr) {
+		const segments = shellSegments(command.slice(prCheckPrefix(state.review.pr.checkoutLocation).length));
+		if (!segments?.every(seg => {
+			if (!/^git(?:\s|$)/i.test(seg)) return true;
+			if (readOnlyCommandIssue(seg) !== null) return false;
+			const sub = seg.match(/^git\s+([a-z-]+)(?:\s|$)/i)?.[1];
+			return !!sub && /^(?:status|log|diff|show|rev-parse|ls-files|shortlog|describe|merge-base|for-each-ref|name-rev|check-ignore|stash|remote|branch|config)$/.test(sub) &&
+				!/--(?:ext-diff|textconv|exec|output|paginate)\b/i.test(seg);
+		})) return false;
+	}
+	return true;
 }
 
 /** The single workflow artifact the model may write in the given phase. */
@@ -434,8 +454,8 @@ function gateReviewToolCall(
 	if (toolName === "bash" || toolName === "powershell") {
 		const command = typeof input?.command === "string" ? input.command : undefined;
 		if (command !== undefined && state.review?.pr && state.review.approvedChecks.includes(command.trim()) &&
-			(toolName !== "bash" || !hasPrCheckDirectory(state, command))) {
-			return { block: true, reason: `PR verification requires bash and the exact approved checkout prefix: ${prCheckPrefix(state.review.pr.checkoutLocation)}. Replan old checks without this prefix.` };
+			(toolName !== "bash" || !isApprovedReviewCheck(state, command))) {
+			return { block: true, reason: `PR verification requires bash and a safe check in the exact approved checkout prefix: ${prCheckPrefix(state.review.pr.checkoutLocation)}. Replan unsafe checks.` };
 		}
 		if (command === undefined || isReadOnlyCommand(command) ||
 			((state.phase === "act" || state.phase === "consolidate") && isApprovedReviewCheck(state, command))) return null;

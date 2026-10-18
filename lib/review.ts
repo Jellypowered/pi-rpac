@@ -460,7 +460,7 @@ export function captureReviewSnapshot(root: string, mode: string, exclusions: Re
 }
 
 /** Compare identities, ignoring capture timestamps and display-only path text. */
-export function compareReviewSnapshots(before: ReviewSnapshot, after: ReviewSnapshot): ReviewDrift {
+export function compareReviewSnapshots(before: Pick<ReviewSnapshot, "items" | "fingerprint">, after: Pick<ReviewSnapshot, "items" | "fingerprint">): ReviewDrift {
 	const oldItems = new Map(before.items.map((item) => [item.id, canonicalJson(item)]));
 	const newItems = new Map(after.items.map((item) => [item.id, canonicalJson(item)]));
 	const addedItemIds = [...newItems.keys()].filter((id) => !oldItems.has(id)).sort();
