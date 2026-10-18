@@ -28,7 +28,9 @@ import { Type, type Static } from "typebox";
 import {
 	type RpacState,
 	type ReviewMode,
+	type PrReviewMeta,
 	REVIEW_MODES,
+	PR_REVIEW_MODE,
 	RpacStateError,
 	newReviewState,
 	newState,
@@ -76,8 +78,24 @@ import {
 	type ArtifactWhich,
 } from "../lib/store.ts";
 import { RpacLockError, acquireLock, isPidAlive, readLockRecord, refreshLock, releaseLock, holdsLock } from "../lib/lock.ts";
-import { captureBaseline, detectDivergence } from "../lib/git.ts";
+import { captureBaseline, detectDivergence, gitInfo } from "../lib/git.ts";
+import { runGitText } from "../lib/review.ts";
 import { captureReviewSnapshot, compareReviewSnapshots, type ReviewExclusion, type ReviewSnapshot } from "../lib/review.ts";
+import {
+	assessPrCheckout,
+	buildPrMeta,
+	capturePrSnapshot,
+	defaultGhRunner,
+	performPrCheckout,
+	prWorktreePath,
+	removePrWorktree,
+	resolvePrHeadSha,
+	resolvePrMeta,
+	verifyGitObjects,
+	type GhRunner,
+	type PrReviewSnapshot,
+	type ResolvedPr,
+} from "../lib/pr.ts";
 import {
 	artifactFile,
 	relArtifactPath,
@@ -100,6 +118,11 @@ import {
 	reviewConsolidateDirective,
 	reviewPlanDirective,
 	reviewRefineDirective,
+	prRefineDirective,
+	prPlanDirective,
+	prActDirective,
+	prConsolidateDirective,
+	type PrPromptMeta,
 } from "../lib/prompts.ts";
 
 // ---------------------------------------------------------------------------
@@ -127,7 +150,13 @@ function describeState(s: RpacState): string {
 			: !s.approvals.plan && (s.phase === "plan" || s.phase === "act")
 				? " ·plan?"
 				: "";
-	return `◆ ${s.workflowKind === "review" ? `review:${s.review?.mode ?? "?"} ` : ""}${s.phase}${taskPart}${paused}${approval}`;
+	const kind =
+		s.workflowKind === "review"
+			? s.review?.mode === "pr" && s.review.pr
+				? `review:pr#${s.review.pr.number} `
+				: `review:${s.review?.mode ?? "?"} `
+				: "";
+	return `◆ ${kind}${s.phase}${taskPart}${paused}${approval}`;
 }
 
 /**
@@ -230,6 +259,19 @@ function statusReport(root: string): string {
 		lines.push(
 			`Review: ${state.review.mode} on ${state.review.head.slice(0, 12)}; fingerprint ${state.review.fingerprint.slice(0, 12)}…; coverage ${coverage.covered}/${coverage.total}; uncovered ${coverage.uncovered.length}${state.review.drift ? "; DRIFT DETECTED" : ""}`,
 		);
+		if (state.review.pr) {
+			const pr = state.review.pr;
+			lines.push(`PR: #${pr.number} ${pr.url} (${pr.state}${pr.crossRepository ? ", fork" : ""}) — "${pr.title}"`);
+			lines.push(`PR scope: base ${pr.baseRef} @ ${pr.baseSha.slice(0, 8)} → head ${pr.headRef} @ ${pr.headSha.slice(0, 8)}; repo ${pr.repository}`);
+			lines.push(`PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}`);
+			if (state.phase !== "done" && state.phase !== "aborted") {
+				if (pr.checkoutStrategy === "in-place") {
+					lines.push(`PR restore: to return to the pre-review branch run \`git checkout ${pr.originalBranch || "(detached)"}\` (original HEAD ${pr.originalHead.slice(0, 8)}). RPAC never auto-restores (it could overwrite new work).`);
+				} else {
+					lines.push(`PR cleanup: remove the isolated worktree with \`/rpac pr-cleanup\` (or \`git worktree remove --force ${prWorktreePath(root, pr.number)}\`). The main worktree was not touched.`);
+				}
+			}
+		}
 	}
 	for (const note of stalenessNotes(root, state).filter((n) => !n.startsWith("git:"))) lines.push(`Stale: ${note}`);
 	if (state.baseline) {
@@ -299,7 +341,81 @@ function readReviewSnapshot(root: string, state: RpacState): ReviewSnapshot {
 	}
 }
 
-function captureStableReviewSnapshot(root: string, mode: ReviewMode, exclusions: ReviewExclusion[]): ReviewSnapshot {
+/** Read + integrity-check the persisted PR (base...head) manifest. */
+function readPrSnapshot(root: string, state: RpacState): PrReviewSnapshot {
+	if (!isPrReview(state)) throw new RpacGuardError("active workflow is not a PR review");
+	const path = resolve(root, state.review!.manifest.path);
+	const rel = relative(root, path);
+	if (!rel || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\") || isAbsolute(rel)) {
+		throw new RpacGuardError(`review manifest path escapes the project: ${state.review!.manifest.path}`);
+	}
+	if (sha256File(path) !== state.review!.manifest.sha256) {
+		throw new RpacGuardError("review manifest is missing or changed since capture — recapture the review scope before continuing");
+	}
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as PrReviewSnapshot;
+	} catch {
+		throw new RpacGuardError("review manifest is not valid JSON — recapture the review scope before continuing");
+	}
+}
+
+/** Capture a stable PR base...head snapshot (object-level; double-capture for stability). */
+function captureStablePrSnapshot(root: string, pr: PrReviewMeta, exclusions: ReviewExclusion[]): PrReviewSnapshot {
+	const first = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, exclusions);
+	const second = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, exclusions);
+	if (!compareReviewSnapshots(first as unknown as ReviewSnapshot, second as unknown as ReviewSnapshot).unchanged) {
+		throw new RpacGuardError("the PR refs changed while the snapshot was being captured — retry when stable");
+	}
+	return second;
+}
+
+/**
+ * PR drift recheck: recompute the recorded base...head object diff and
+ * re-resolve the current PR head. A force-pushed head or a changed diff
+ * invalidates affected coverage; the reviewed commit is NEVER switched
+ * silently. gh failures are reported, not treated as drift.
+ */
+function recheckPrSnapshot(root: string, state: RpacState, gh: GhRunner): string | null {
+	const pr = state.review!.pr!;
+	let fingerprint = state.review!.fingerprint;
+	let added: string[] = [];
+	let removed: string[] = [];
+	let changed: string[] = [];
+	let note = "";
+	try {
+		const before = readPrSnapshot(root, state);
+		const after = capturePrSnapshot(root, pr.baseSha, pr.headSha, pr.number, state.review!.exclusions);
+		const drift = compareReviewSnapshots(before as unknown as ReviewSnapshot, after as unknown as ReviewSnapshot);
+		fingerprint = after.fingerprint;
+		added = drift.addedItemIds;
+		removed = drift.removedItemIds;
+		changed = drift.changedItemIds;
+	} catch (err) {
+		// The recorded commit may no longer be reproducible (e.g. force-pushed +
+		// GC'd). Invalidate all coverage and say so honestly.
+		removed = [...state.review!.scopeItemIds];
+		note = ` recorded scope is no longer reproducible (${(err as Error).message})`;
+	}
+	// Force-push detection via the live PR head.
+	try {
+		const currentHead = resolvePrHeadSha(gh, root, pr.number);
+		if (currentHead !== pr.headSha) {
+			added = [];
+			changed = [];
+			removed = [...state.review!.scopeItemIds];
+			note = ` PR #${pr.number} head changed (force-pushed) ${pr.headSha.slice(0, 12)} → ${currentHead.slice(0, 12)} — review evidence is stale; re-review the new head`;
+		}
+	} catch (err) {
+		if (!note) note = ` (could not re-resolve the PR head: ${(err as Error).message})`;
+	}
+	return updateActive(root, (current) => {
+		if (current.id !== state.id) throw new RpacGuardError("active workflow changed during PR drift check");
+		const res = recordReviewDrift(current, fingerprint, added, removed, changed);
+		return note ? `${res.message}${note}` : res.message;
+	});
+}
+
+function captureStableReviewSnapshot(root: string, mode: string, exclusions: ReviewExclusion[]): ReviewSnapshot {
 	const first = captureReviewSnapshot(root, mode, exclusions);
 	const second = captureReviewSnapshot(root, mode, exclusions);
 	if (!compareReviewSnapshots(first, second).unchanged) {
@@ -313,11 +429,41 @@ function captureAndReplaceReviewScope(root: string, state: RpacState, exclusions
 	if (state.phase !== "refine" && state.phase !== "plan") {
 		throw new RpacGuardError(`review scope can only be recaptured in refine/plan, not ${state.phase}`);
 	}
-	const rawSnapshot = captureStableReviewSnapshot(root, state.review.mode, []);
 	const seenExclusions = new Set<string>();
 	for (const exclusion of exclusions) {
 		if (seenExclusions.has(exclusion.path)) throw new RpacGuardError(`duplicate review exclusion: ${exclusion.path}`);
 		seenExclusions.add(exclusion.path);
+	}
+	let fingerprint: string;
+	let scopeItemIds: string[];
+	let head: string;
+	let unborn: boolean;
+	let capturedAt: string;
+	if (isPrReview(state)) {
+		const pr = state.review.pr!;
+		const rawSnapshot = captureStablePrSnapshot(root, pr, []);
+		for (const exclusion of exclusions) {
+			if (!rawSnapshot.items.some((item) => item.path === exclusion.path)) {
+				throw new RpacGuardError(`review exclusion is not an exact in-scope path: ${exclusion.path}`);
+			}
+		}
+		const snapshot = exclusions.length > 0 ? captureStablePrSnapshot(root, pr, exclusions) : rawSnapshot;
+		fingerprint = snapshot.fingerprint;
+		scopeItemIds = snapshot.items.map((item) => item.id);
+		head = snapshot.headSha;
+		unborn = false;
+		capturedAt = snapshot.capturedAt;
+		const text = JSON.stringify(snapshot, null, 2) + "\n";
+		const path = reviewManifestFile(root, state.id);
+		atomicWriteFile(path, text);
+		const artifact = { path: relArtifactPath(root, path), sha256: sha256Text(text), updatedAt: nowIso() };
+		return updateActive(root, (current) => {
+			if (current.id !== state.id) throw new RpacGuardError("active workflow changed during review scope capture");
+			return replaceReviewScope(current, { fingerprint, manifest: artifact, head, unborn, capturedAt, scopeItemIds, exclusions }).message;
+		});
+	}
+	const rawSnapshot = captureStableReviewSnapshot(root, state.review.mode, []);
+	for (const exclusion of exclusions) {
 		if (!rawSnapshot.items.some((item) => item.path === exclusion.path)) {
 			throw new RpacGuardError(`review exclusion is not an exact in-scope path: ${exclusion.path}`);
 		}
@@ -347,8 +493,9 @@ function captureAndReplaceReviewScope(root: string, state: RpacState, exclusions
 }
 
 /** Re-capture selected state and persist relevant drift. */
-function recheckReviewSnapshot(root: string, state: RpacState): string | null {
+function recheckReviewSnapshot(root: string, state: RpacState, gh: GhRunner): string | null {
 	if (state.workflowKind !== "review" || !state.review) return null;
+	if (isPrReview(state)) return recheckPrSnapshot(root, state, gh);
 	const before = readReviewSnapshot(root, state);
 	const after = captureReviewSnapshot(root, state.review.mode, state.review.exclusions);
 	const drift = compareReviewSnapshots(before, after);
@@ -557,12 +704,55 @@ function textResult(text: string, details?: Record<string, unknown>) {
 // Extension factory
 // ---------------------------------------------------------------------------
 
-export default function rpacExtension(pi: ExtensionAPI): void {
+/** True when a review workflow targets a GitHub PR (module-level; pure). */
+function isPrReview(state: RpacState): boolean {
+	return state.workflowKind === "review" && state.review?.mode === PR_REVIEW_MODE && Boolean(state.review.pr);
+}
+
+export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGhRunner): void {
 	// Queue a phase directive as a follow-up user message; works whether or not
 	// the agent is currently streaming.
 	const issueDirective = (text: string): void => {
 		pi.sendUserMessage(text, { deliverAs: "followUp" });
 	};
+
+	function prPromptMeta(pr: PrReviewMeta): PrPromptMeta {
+		return {
+			number: pr.number,
+			url: pr.url,
+			title: pr.title,
+			baseRef: pr.baseRef,
+			baseSha: pr.baseSha,
+			headRef: pr.headRef,
+			headSha: pr.headSha,
+			repository: pr.repository,
+			crossRepository: pr.crossRepository,
+			checkoutStrategy: pr.checkoutStrategy,
+			checkoutLocation: pr.checkoutLocation,
+		};
+	}
+
+	/** The consolidate directive for the active review (PR-aware). */
+	function reviewConsolidateDirFor(state: RpacState, root: string): string {
+		if (isPrReview(state)) {
+			return prConsolidateDirective(
+				prPromptMeta(state.review!.pr!),
+				reviewReportFile(root, state.id),
+				relWorkflowArtifactPath(root, state.id, "requirements"),
+				relWorkflowArtifactPath(root, state.id, "plan"),
+				state.review!.manifest.path,
+				relWorkflowArtifactPath(root, state.id, "log"),
+			);
+		}
+		return reviewConsolidateDirective(
+			state.review!.mode,
+			reviewReportFile(root, state.id),
+			relWorkflowArtifactPath(root, state.id, "requirements"),
+			relWorkflowArtifactPath(root, state.id, "plan"),
+			state.review!.manifest.path,
+			relWorkflowArtifactPath(root, state.id, "log"),
+		);
+	}
 
 	const SUBCOMMANDS = [
 		"start",
@@ -578,6 +768,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		"accept",
 		"pause",
 		"abort",
+		"pr-cleanup",
 		"handoff",
 		"cleanup",
 	] as const;
@@ -596,6 +787,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		"accept": "accept a documented exception: /rpac accept <task-id> <reason> (failed → done)",
 		"pause": "pause further workflow execution",
 		"abort": "stop the workflow (keeps all files; --yes required headless)",
+		"pr-cleanup": "remove the isolated PR worktree for the active PR review (main worktree untouched)",
 		"handoff": "write handoff.md; in TUI, start a fresh session with it",
 		"cleanup": "remove all RPAC state (--yes required headless)",
 	};
@@ -612,6 +804,16 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 
 	async function cmdStart(ctx: ExtensionCommandContext, args: string): Promise<void> {
 		const tokens = args.trim().split(/\s+/).filter(Boolean);
+		// PR preview subcommand: /rpac start preview <pr-number> [--yes]
+		if (tokens[0]?.toLowerCase() === "preview") {
+			const { flags, rest } = parseFlags(tokens.slice(1));
+			if (rest.trim().includes(" ")) {
+				ctx.ui.notify("Usage: /rpac start preview <pr-number>  (a single positive integer)", "error");
+				return;
+			}
+			await cmdStartPreview(ctx, rest.trim(), flags.has("yes"));
+			return;
+		}
 		const { flags, rest } = parseFlags(tokens);
 		const task = rest.trim();
 		if (!task) {
@@ -669,9 +871,139 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function cmdStartPreview(ctx: ExtensionCommandContext, prNumberArg: string, yes: boolean): Promise<void> {
+		const root = rootOf(ctx.cwd);
+		let controlLease = false;
+		try {
+			// Validate the PR number (positive integer only).
+			const arg = prNumberArg.trim();
+			if (!/^\d+$/.test(arg) || Number(arg) < 1) {
+				throw new RpacGuardError(`invalid PR number "${prNumberArg}" — it must be a positive integer`);
+			}
+			const prNumber = Number(arg);
+
+			// Existing active-workflow safeguard (same as start/review): save, never destroy.
+			const { state: existing, notes } = loadActive(root, root);
+			reportNotes(ctx.ui, notes);
+			if (existing && existing.phase !== "done" && existing.phase !== "aborted") {
+				if (!ctx.hasUI) {
+					if (!yes) {
+						throw new RpacGuardError(
+							`an active workflow exists (${existing.id}, phase ${existing.phase}, "${existing.task}"). ` +
+							`Headless preview cannot replace it: run /rpac start preview --yes ${arg} to replace, or /rpac abort first.`,
+						);
+					}
+				} else {
+					const ok = await ctx.ui.confirm(
+						"RPAC: start a PR review now?",
+						`The active workflow remains saved and resumable:\n  ${existing.id} — ${existing.phase} — ${existing.task}\n\nStart a report-only review of PR #${prNumber}?`,
+					);
+					if (!ok) {
+						ctx.ui.notify("Cancelled. Active workflow untouched.", "info");
+						return;
+					}
+				}
+			}
+
+			// gh requirements.
+			if (!gh.isAvailable()) {
+				throw new RpacGuardError("the GitHub CLI (\`gh\`) is not on PATH — install it (https://cli.github.com) and retry");
+			}
+			const auth = gh.isAuthed();
+			if (!auth.ok) {
+				throw new RpacGuardError(`GitHub CLI is not authenticated (${auth.reason ?? "unknown reason"}) — run \`gh auth login\` and retry`);
+			}
+
+			// Repository identity + remote.
+			const info = gitInfo(root);
+			if (!info.isRepo) throw new RpacGuardError("PR review requires a Git work tree — this directory is not a Git repository");
+			const assessment = assessPrCheckout(root);
+			if (!assessment.hasRemote || !assessment.remote) {
+				throw new RpacGuardError("PR review requires a Git remote to fetch the PR refs — add one (e.g. \`git remote add origin <url>\`) and retry");
+			}
+			const remote = assessment.remote;
+
+			// Resolve PR metadata (base/head, state, url, title, body).
+			let resolved: ResolvedPr;
+			try {
+				resolved = resolvePrMeta(gh.prView(root, prNumber));
+			} catch (err) {
+				throw new RpacGuardError(`could not resolve PR #${prNumber}: ${(err as Error).message}`);
+			}
+			const stateNote = resolved.state === "open" ? "" : ` · PR state: ${resolved.state}`;
+
+			// Choose the checkout strategy: in-place when the tree is clean, isolated
+			// worktree when it is not (never discard local work).
+			const strategy: "in-place" | "worktree" = assessment.clean ? "in-place" : "worktree";
+			const original = { branch: info.branch, head: info.head, dirty: info.dirty };
+
+			// Take the control lease before mutating Git, and confirm the active
+			// workflow has not changed underneath us.
+			acquireActLease(root, "control:preview");
+			controlLease = true;
+			const currentId = loadActive(root, root).state?.id ?? null;
+			if (currentId !== (existing?.id ?? null)) {
+				throw new RpacGuardError("the active workflow changed while preview confirmation was pending — review status and retry");
+			}
+
+			let outcome;
+			try {
+				outcome = performPrCheckout(root, resolved, strategy, gh, remote);
+			} catch (err) {
+				throw new RpacGuardError(`PR checkout failed: ${(err as Error).message}`);
+			}
+
+			// Ensure the base + head objects are present locally for the diff.
+			if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
+				if (resolved.baseRef) runGitText(root, ["fetch", remote, resolved.baseRef], true);
+				if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
+					throw new RpacGuardError(
+						`the PR base/head objects are not available locally (base ${resolved.baseSha.slice(0, 12)}, head ${resolved.headSha.slice(0, 12)}) — ` +
+						`run \`git fetch ${remote}\` to obtain them and retry`,
+					);
+				}
+			}
+
+			const prMeta = buildPrMeta(resolved, outcome, original);
+			const snapshot = captureStablePrSnapshot(root, prMeta, []);
+			const manifestText = JSON.stringify(snapshot, null, 2) + "\n";
+			const state = newReviewState(root, {
+				mode: PR_REVIEW_MODE,
+				fingerprint: snapshot.fingerprint,
+				manifestSha256: sha256Text(manifestText),
+				head: snapshot.headSha,
+				unborn: false,
+				capturedAt: snapshot.capturedAt,
+				scopeItemIds: snapshot.items.map((item) => item.id),
+				pr: prMeta,
+				task: `PR review #${prNumber} — ${resolved.title}`,
+			});
+			state.baseline = captureBaseline(root);
+			mkdirSync(workflowDir(root, state.id), { recursive: true });
+			atomicWriteFile(reviewManifestFile(root, state.id), manifestText);
+			createWorkflow(root, state, true);
+			appendLog(
+				root,
+				state.id,
+				`- **${nowIso()}** PR review #${prNumber} ${resolved.url}; base ${resolved.baseRef} @ ${resolved.baseSha.slice(0, 8)} → head ${resolved.headRef} @ ${resolved.headSha.slice(0, 8)}; checkout ${strategy} @ ${outcome.location}${stateNote}`,
+			);
+			releaseLock(root, LEASE_NAME);
+			controlLease = false;
+			issueDirective(prRefineDirective(prPromptMeta(prMeta), artifactFile(root, state.id, "requirements"), state.review!.manifest.path));
+			refreshUI(ctx.ui, root);
+			ctx.ui.notify(
+				`RPAC PR review ${state.id} started. PR #${prNumber} (${resolved.state}${prMeta.crossRepository ? ", fork" : ""}); scope: ${snapshot.items.length} file(s); checkout: ${strategy}${stateNote}. Phase: refine.`,
+				"info",
+			);
+		} catch (err) {
+			if (controlLease) releaseLock(root, LEASE_NAME);
+			fail(ctx.ui, err, "PR preview start failed");
+		}
+	}
+
 	async function cmdReview(ctx: ExtensionCommandContext, args: string): Promise<void> {
 		const tokens = args.trim().split(/\s+/).filter(Boolean);
-		if (tokens.length > 1 || (tokens[0] && !REVIEW_MODES.includes(tokens[0].toLowerCase() as ReviewMode))) {
+		if (tokens.length > 1 || (tokens[0] && !(REVIEW_MODES as readonly string[]).includes(tokens[0].toLowerCase()))) {
 			ctx.ui.notify("Usage: /rpac review [current|staged|full] (no branch/base/options; default: current)", "error");
 			return;
 		}
@@ -755,7 +1087,11 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			}
 			if (state.workflowKind === "review" && state.review) {
 				if (args.trim()) throw new RpacGuardError("/rpac refine notes are not supported for review workflows; record intent in requirements");
-				issueDirective(reviewRefineDirective(state.review.mode, artifactFile(root, state.id, "requirements"), state.review.manifest.path));
+				issueDirective(
+					isPrReview(state)
+						? prRefineDirective(prPromptMeta(state.review.pr!), artifactFile(root, state.id, "requirements"), state.review.manifest.path)
+						: reviewRefineDirective(state.review.mode, artifactFile(root, state.id, "requirements"), state.review.manifest.path),
+				);
 			} else {
 				issueDirective(refineDirective(state.task, artifactFile(root, state.id, "requirements"), args || undefined));
 			}
@@ -812,12 +1148,19 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			if (cur.workflowKind === "review" && cur.review) {
 				if (args.trim()) throw new RpacGuardError("/rpac plan notes are not supported for review workflows; keep scope in approved requirements");
 				issueDirective(
-					reviewPlanDirective(
-						cur.review.mode,
-						artifactFile(root, cur.id, "plan"),
-						relWorkflowArtifactPath(root, cur.id, "requirements"),
-						cur.review.manifest.path,
-					),
+					isPrReview(cur)
+						? prPlanDirective(
+							prPromptMeta(cur.review.pr!),
+							artifactFile(root, cur.id, "plan"),
+							relWorkflowArtifactPath(root, cur.id, "requirements"),
+							cur.review.manifest.path,
+						)
+						: reviewPlanDirective(
+							cur.review.mode,
+							artifactFile(root, cur.id, "plan"),
+							relWorkflowArtifactPath(root, cur.id, "requirements"),
+							cur.review.manifest.path,
+						),
 				);
 			} else {
 				issueDirective(planDirective(cur.task, artifactFile(root, cur.id, "plan"), artifactFile(root, cur.id, "requirements"), args || undefined));
@@ -865,7 +1208,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			acquireActLease(root, state.id);
 			leaseAcquired = true;
 			if (state.workflowKind === "review") {
-				const driftMessage = recheckReviewSnapshot(root, state);
+				const driftMessage = recheckReviewSnapshot(root, state, gh);
 				if (driftMessage && !/unchanged/.test(driftMessage)) ctx.ui.notify(`RPAC: ${driftMessage}`, "warning");
 				({ state, notes } = loadActive(root, root));
 				if (!state) throw new RpacStateError("not_found", "review workflow disappeared during snapshot check");
@@ -908,15 +1251,25 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			appendLog(root, cur.id, `- **${nowIso()}** ${result.message}`);
 			issueDirective(
 				cur.workflowKind === "review" && cur.review
-					? reviewActDirective(
-						cur.review.mode,
-						task.id,
-						task.title,
-						task.reviewItemIds ?? [],
-						relArtifactPath(root, reviewBatchFile(root, cur.id, task.id)),
-						relWorkflowArtifactPath(root, cur.id, "plan"),
-						cur.approvals.sequential,
-					)
+					? (isPrReview(cur)
+						? prActDirective(
+							prPromptMeta(cur.review.pr!),
+							task.id,
+							task.title,
+							task.reviewItemIds ?? [],
+							relArtifactPath(root, reviewBatchFile(root, cur.id, task.id)),
+							relWorkflowArtifactPath(root, cur.id, "plan"),
+							cur.approvals.sequential,
+						)
+						: reviewActDirective(
+							cur.review.mode,
+							task.id,
+							task.title,
+							task.reviewItemIds ?? [],
+							relArtifactPath(root, reviewBatchFile(root, cur.id, task.id)),
+							relWorkflowArtifactPath(root, cur.id, "plan"),
+							cur.approvals.sequential,
+						))
 					: actDirective(
 						cur.task,
 						task.id,
@@ -970,7 +1323,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			acquireActLease(root, `control:consolidate:${state.id}`);
 			controlLease = true;
 			if (state.workflowKind === "review") {
-				const driftMessage = recheckReviewSnapshot(root, state);
+				const driftMessage = recheckReviewSnapshot(root, state, gh);
 				if (driftMessage && !/unchanged/.test(driftMessage)) ctx.ui.notify(`RPAC: ${driftMessage}`, "warning");
 			}
 			updateActive(root, (s) => {
@@ -985,14 +1338,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 			controlLease = false;
 			issueDirective(
 				cur.workflowKind === "review" && cur.review
-					? reviewConsolidateDirective(
-						cur.review.mode,
-						reviewReportFile(root, cur.id),
-						relWorkflowArtifactPath(root, cur.id, "requirements"),
-						relWorkflowArtifactPath(root, cur.id, "plan"),
-						cur.review.manifest.path,
-						relWorkflowArtifactPath(root, cur.id, "log"),
-					)
+					? reviewConsolidateDirFor(cur, root)
 					: consolidateDirective(
 						cur.task,
 						artifactFile(root, cur.id, "report"),
@@ -1104,7 +1450,9 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 				case "refine":
 					issueDirective(
 						cur.workflowKind === "review" && cur.review
-							? reviewRefineDirective(cur.review.mode, artifactFile(root, cur.id, "requirements"), cur.review.manifest.path)
+							? (isPrReview(cur)
+								? prRefineDirective(prPromptMeta(cur.review.pr!), artifactFile(root, cur.id, "requirements"), cur.review.manifest.path)
+								: reviewRefineDirective(cur.review.mode, artifactFile(root, cur.id, "requirements"), cur.review.manifest.path))
 							: refineDirective(cur.task, artifactFile(root, cur.id, "requirements")),
 					);
 					break;
@@ -1112,12 +1460,19 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 					if (cur.approvals.requirements) {
 						issueDirective(
 							cur.workflowKind === "review" && cur.review
-								? reviewPlanDirective(
-									cur.review.mode,
-									artifactFile(root, cur.id, "plan"),
-									relWorkflowArtifactPath(root, cur.id, "requirements"),
-									cur.review.manifest.path,
-								)
+								? (isPrReview(cur)
+									? prPlanDirective(
+										prPromptMeta(cur.review.pr!),
+										artifactFile(root, cur.id, "plan"),
+										relWorkflowArtifactPath(root, cur.id, "requirements"),
+										cur.review.manifest.path,
+									)
+									: reviewPlanDirective(
+										cur.review.mode,
+										artifactFile(root, cur.id, "plan"),
+										relWorkflowArtifactPath(root, cur.id, "requirements"),
+										cur.review.manifest.path,
+									))
 								: planDirective(cur.task, artifactFile(root, cur.id, "plan"), artifactFile(root, cur.id, "requirements")),
 						);
 					} else {
@@ -1139,7 +1494,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						acquireActLease(root, cur.id);
 						leaseAcquired = true;
 						if (cur.workflowKind === "review") {
-							const driftMessage = recheckReviewSnapshot(root, cur);
+							const driftMessage = recheckReviewSnapshot(root, cur, gh);
 							if (driftMessage && !/unchanged/.test(driftMessage)) ctx.ui.notify(`RPAC: ${driftMessage}`, "warning");
 							cur = loadActive(root, root).state!;
 						}
@@ -1156,15 +1511,25 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						}
 						issueDirective(
 							active.workflowKind === "review" && active.review
-								? reviewActDirective(
-									active.review.mode,
-									task.id,
-									requested ? `${task.title} (resume — verify existing batch evidence first)` : task.title,
-									task.reviewItemIds ?? [],
-									relArtifactPath(root, reviewBatchFile(root, active.id, task.id)),
-									relWorkflowArtifactPath(root, active.id, "plan"),
-									active.approvals.sequential,
-								)
+								? (isPrReview(active)
+									? prActDirective(
+										prPromptMeta(active.review.pr!),
+										task.id,
+										requested ? `${task.title} (resume — verify existing batch evidence first)` : task.title,
+										task.reviewItemIds ?? [],
+										relArtifactPath(root, reviewBatchFile(root, active.id, task.id)),
+										relWorkflowArtifactPath(root, active.id, "plan"),
+										active.approvals.sequential,
+									)
+									: reviewActDirective(
+										active.review.mode,
+										task.id,
+										requested ? `${task.title} (resume — verify existing batch evidence first)` : task.title,
+										task.reviewItemIds ?? [],
+										relArtifactPath(root, reviewBatchFile(root, active.id, task.id)),
+										relWorkflowArtifactPath(root, active.id, "plan"),
+										active.approvals.sequential,
+									))
 								: actDirective(
 									active.task,
 									task.id,
@@ -1184,7 +1549,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 					if (cur.workflowKind === "review") {
 						acquireActLease(root, `control:resume-review:${cur.id}`);
 						try {
-							const driftMessage = recheckReviewSnapshot(root, cur);
+							const driftMessage = recheckReviewSnapshot(root, cur, gh);
 							if (driftMessage && !/unchanged/.test(driftMessage)) ctx.ui.notify(`RPAC: ${driftMessage}`, "warning");
 							cur = loadActive(root, root).state!;
 						} finally {
@@ -1193,14 +1558,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 					}
 					issueDirective(
 						cur.workflowKind === "review" && cur.review
-							? reviewConsolidateDirective(
-								cur.review.mode,
-								reviewReportFile(root, cur.id),
-								relWorkflowArtifactPath(root, cur.id, "requirements"),
-								relWorkflowArtifactPath(root, cur.id, "plan"),
-								cur.review.manifest.path,
-								relWorkflowArtifactPath(root, cur.id, "log"),
-							)
+							? reviewConsolidateDirFor(cur, root)
 							: consolidateDirective(
 								cur.task,
 								artifactFile(root, cur.id, "report"),
@@ -1357,6 +1715,53 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	async function cmdPrCleanup(ctx: ExtensionCommandContext, args: string): Promise<void> {
+		const root = rootOf(ctx.cwd);
+		const { flags } = parseFlags(args.trim().split(/\s+/).filter(Boolean));
+		let controlLease = false;
+		try {
+			const { state } = loadActive(root, root);
+			if (!state) {
+				ctx.ui.notify("RPAC: no active workflow.", "info");
+				return;
+			}
+			if (!isPrReview(state)) {
+				throw new RpacGuardError("pr-cleanup only applies to a PR review workflow — the active workflow is not a PR review");
+			}
+			const pr = state.review!.pr!;
+			if (pr.checkoutStrategy !== "worktree") {
+				ctx.ui.notify(
+					`RPAC: this PR review used the in-place checkout. RPAC does not auto-restore the branch (it could overwrite new work). To return to the pre-review state run:\n  git checkout ${pr.originalBranch || "(detached)"}\n  (original HEAD ${pr.originalHead.slice(0, 8)})`,
+					"info",
+				);
+				return;
+			}
+			if (!ctx.hasUI) {
+				if (!flags.has("yes")) throw new RpacGuardError("headless pr-cleanup requires explicit consent: /rpac pr-cleanup --yes");
+			} else {
+				const ok = await ctx.ui.confirm(
+					"RPAC: remove the isolated PR worktree?",
+					`This removes ${prWorktreePath(root, pr.number)}. Your main worktree and its changes are NOT touched.`,
+				);
+				if (!ok) {
+					ctx.ui.notify("Cancelled.", "info");
+					return;
+				}
+			}
+			acquireActLease(root, "control:pr-cleanup");
+			controlLease = true;
+			const result = removePrWorktree(root, pr.number);
+			releaseLock(root, LEASE_NAME);
+			controlLease = false;
+			appendLog(root, state.id, `- **${nowIso()}** pr-cleanup: ${result}`);
+			refreshUI(ctx.ui, root);
+			ctx.ui.notify(`RPAC: ${result}.`, "info");
+		} catch (err) {
+			if (controlLease) releaseLock(root, LEASE_NAME);
+			fail(ctx.ui, err, "pr-cleanup failed");
+		}
+	}
+
 	function buildHandoff(state: RpacState): string {
 		const open = state.tasks.filter((t) => t.status !== "done");
 		const decisions = state.events.filter((e) => e.kind === "decision" || e.kind === "deviation");
@@ -1375,6 +1780,11 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		if (state.review) {
 			const coverage = reviewCoverage(state);
 			lines.push(`- Review manifest: ${state.review.manifest.path} (${state.review.fingerprint}); coverage ${coverage.covered}/${coverage.total}; uncovered ${coverage.uncovered.length}`);
+			if (state.review.pr) {
+				const pr = state.review.pr;
+				lines.push(`- PR: #${pr.number} ${pr.url} (${pr.state}) — "${pr.title}"; base ${pr.baseRef}@${pr.baseSha.slice(0, 8)} → head ${pr.headRef}@${pr.headSha.slice(0, 8)}`);
+				lines.push(`- PR checkout: ${pr.checkoutStrategy} @ ${pr.checkoutLocation}${pr.checkoutStrategy === "in-place" ? ` (restore: git checkout ${pr.originalBranch || "(detached)"})` : " (cleanup: /rpac pr-cleanup)"}`);
+			}
 		}
 		lines.push("");
 		if (state.tasks.length > 0) {
@@ -1396,7 +1806,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 		lines.push("## Continuation");
 		lines.push(
 			state.workflowKind === "review"
-				? `You are a fresh session continuing an RPAC report-only review. Read ${wf}/workflow.json, its manifest, requirements, plan, batch artifacts, and log. Recheck snapshot drift, follow the rpac-review section for phase "${state.phase}", and never edit reviewed files or Git state.`
+				? `You are a fresh session continuing an RPAC report-only${state.review?.pr ? ` PR #${state.review.pr.number}` : ""} review. Read ${wf}/workflow.json, its manifest, requirements, plan, batch artifacts, and log. Recheck snapshot drift, follow the rpac-review "PR REVIEW" section (for PR reviews) for phase "${state.phase}", and never edit reviewed files, Git state, or the remote. The PR head is checked out at the location recorded in workflow.json.`
 				: `You are a fresh session continuing an RPAC workflow. The state files are the source of truth: read ${wf}/workflow.json, the requirements and plan listed above, and re-verify against the repository (git state may have moved). Continue in phase "${state.phase}" using the matching rpac-* skill. Do not commit or publish.`,
 		);
 		return lines.join("\n");
@@ -1450,7 +1860,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("rpac", {
 		description:
-			"RPAC workflow: /rpac [start <task>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|list|resume|accept|pause|abort|handoff|cleanup]",
+			"RPAC workflow: /rpac [start <task>|start preview <pr-number>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|list|resume|accept|pause|abort|pr-cleanup|handoff|cleanup]",
 		getArgumentCompletions: (prefix) => {
 			const matches = SUBCOMMANDS.filter((s) => s.startsWith(prefix.toLowerCase()));
 			if (matches.length === 0) return null;
@@ -1502,6 +1912,9 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						break;
 					case "abort":
 						await cmdAbort(ctx, rest);
+						break;
+					case "pr-cleanup":
+						await cmdPrCleanup(ctx, rest);
 						break;
 					case "handoff":
 						await cmdHandoff(ctx);
@@ -1712,7 +2125,7 @@ export default function rpacExtension(pi: ExtensionAPI): void {
 						const before = loadActive(root, root).state;
 						if (!before) throw new RpacStateError("not_found", "no active RPAC workflow");
 						if (before.workflowKind === "review") {
-							const driftMessage = recheckReviewSnapshot(root, before);
+							const driftMessage = recheckReviewSnapshot(root, before, gh);
 							if (driftMessage && !/unchanged/.test(driftMessage)) message = `${driftMessage} `;
 						}
 						message += run((s) => {

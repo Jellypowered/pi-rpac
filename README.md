@@ -55,6 +55,13 @@ for exact current, staged, or full Git scope.
   byte-safe Git snapshot, assigns every item to bounded evidence batches, validates candidate
   findings adversarially, detects drift, and writes `review-report.md`. Review execution is
   mechanically report-only in every phase; fixes require a separate ordinary RPAC workflow.
+- **GitHub PR review.** `/rpac start preview <pr-number>` resolves a pull request with the `gh`
+  CLI, safely checks out its exact head (in-place when the work tree is clean, or an isolated
+  `git worktree` when it is dirty), and runs the same approval-gated, report-only review lifecycle
+  against the PR's `base...head` diff. It treats the PR as untrusted input, never posts/merges/
+  comments on GitHub, detects force-push drift, and preserves your local work. A fork (cross-repo)
+  PR is reviewed from its head commit. `/rpac pr-cleanup` removes an isolated worktree when you
+  are done.
 - **Local-model reliability.** Review manifests, exact item assignments, per-batch evidence ledgers,
   no-sampling rules, persisted coverage, observation checks, and explicit same-context limitations
   keep long reviews resumable without pretending incomplete work is clean.
@@ -71,6 +78,9 @@ for exact current, staged, or full Git scope.
 - **git** available on `PATH` (used for baselines, divergence, and review snapshots). Ordinary
   `/rpac start` workflows still work in a non-git directory with baseline features disabled;
   `/rpac review` requires a Git work tree.
+- **GitHub PR review only:** the [`gh` CLI](https://cli.github.com/) on `PATH`, authenticated
+  (`gh auth status`), and a repository with a remote pointing at the PR's GitHub host. `gh` is
+  used **read-only** for PR metadata and checkout; RPAC never issues a mutating `gh` command.
 - Any model configured in Pi, including local models over OpenAI-compatible endpoints. No hosted
   model or new provider is required.
 
@@ -295,6 +305,45 @@ approval claim. A review report records scrutiny—not merge readiness, security
 proof that no defects exist. To implement a finding, start a separate ordinary `/rpac start ...`
 workflow; the review never fixes its subject.
 
+### Reviewing a GitHub pull request
+
+Besides reviewing your local work tree, RPAC can review a **GitHub pull request** directly:
+
+```text
+/rpac start preview <pr-number>     # resolve the PR with gh, check it out, and start a review
+```
+
+The command:
+
+1. **Resolves the PR** with `gh pr view` (number, title, body, base and head refs/SHAs, whether it
+   is a fork/cross-repo PR). The repository must have a remote pointing at the PR's GitHub host.
+2. **Safely checks out the PR head** so the diff is reviewable locally:
+   - **in-place** when your work tree is clean — the PR is checked out detached onto the exact
+     head SHA (your original branch + HEAD are recorded so nothing is lost).
+   - **worktree** when your work tree is dirty — an isolated `git worktree` is created alongside,
+     so your uncommitted changes stay untouched. Clean it up later with `/rpac pr-cleanup`.
+3. **Captures the PR scope** as a deterministic `base...head` manifest (added / modified / deleted
+   / renamed files, with a `base` and a `pr` content layer per file). Fork PRs are reviewed from
+   their head commit, which is fetched by object.
+4. **Runs the normal review lifecycle** — REFINE → PLAN → ACT → CONSOLIDATE — with PR-specific
+   prompts. The PR is treated as **untrusted input**: you are reviewing someone else's diff, not
+   editing it.
+
+Because it is a review workflow, execution stays **report-only**: it cannot modify the reviewed
+files, change Git/index/remote state, or run a mutating `gh` command. It writes
+`review-report.md` with **advisory** findings — it does not post a review, comment, merge, or
+approve the PR on GitHub.
+
+**Drift / force-push.** The base and head SHAs are pinned at start. If the PR is force-pushed
+while you review, RPAC detects the mismatch, **invalidates the affected coverage**, and surfaces it
+— it never silently switches to a different commit. To review the new head, abort and start a fresh
+`/rpac start preview <pr-number>`.
+
+**Restoring your tree.** After an in-place checkout your work tree is at the PR head. Return to
+your original branch with plain Git (the recorded branch/HEAD is shown in `/rpac status`), or
+`/rpac abort` and re-checkout as needed. A worktree-strategy checkout is removed with
+`/rpac pr-cleanup`, which leaves your main tree exactly as it was.
+
 ---
 
 ## Usage — command reference
@@ -307,6 +356,8 @@ status`, `/rpac help`) to see the current state and available actions.
 | `/rpac` | Show current workflow state and available actions. |
 | `/rpac start [--yes] <task>` | Start a new implementation workflow. A non-terminal active workflow becomes a *saved* (resumable) workflow rather than being destroyed; headless replacement requires `--yes`. Captures a git baseline and issues the **refine** directive. |
 | `/rpac review [current\|staged\|full]` | Start an approval-gated, report-only review (default: `current`). Requires a Git work tree; unsupported modes/options/base syntax are rejected. Uses the same active-workflow save/confirm safeguards as `start`. |
+| `/rpac start preview <pr-number>` | Start a report-only **GitHub PR review**: resolve the PR with `gh`, safely check out its head (in-place if the tree is clean, isolated worktree if dirty), capture the `base...head` scope, and issue the PR **refine** directive. Requires `gh` (authenticated), a Git work tree, and a remote pointing at the PR's GitHub host. Never posts/merges/comments on GitHub. |
+| `/rpac pr-cleanup` | Remove the isolated `git worktree` used by a worktree-strategy PR review. Refuses for in-place checkouts (print the plain-Git restore steps instead). Only touches the PR worktree; your main tree is never modified. |
 | `/rpac refine [notes]` | (Re)issue the workflow-kind-specific refine directive. |
 | `/rpac plan [notes]` | Ensure the requirements are approved (dialog), then issue the **plan** directive. |
 | `/rpac act [--sequential] [task #]` | Start executing a task under the ACT execution lease. `--sequential` (or `/rpac approve sequential`) lets the model continue through ready tasks in one run. One task per run by default. |
