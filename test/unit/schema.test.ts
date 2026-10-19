@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	RPAC_STATE_VERSION,
+	RPAC_PREVIEW_STATE_VERSION,
 	TASK_STATUSES,
 	RpacStateError,
 	validateState,
@@ -51,7 +52,7 @@ test("validateState accepts versions 1 and 2 for migration and bumps them", () =
 
 test("validateState rejects unsupported future versions without touching data", () => {
 	assert.throws(
-		() => validateState(base({ version: RPAC_STATE_VERSION + 1 })),
+		() => validateState(base({ version: RPAC_PREVIEW_STATE_VERSION + 1 })),
 		(e: Error) => e instanceof RpacStateError && e.code === "unsupported_version" && /newer/.test(e.message),
 	);
 });

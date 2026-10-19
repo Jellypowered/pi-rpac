@@ -27,8 +27,7 @@ import {
 	type ReviewExclusion,
 	type ReviewLayer,
 	type ReviewManifestItem,
-	runGitBuffer,
-	runGitText,
+	runGitBuffer as rawGitBuffer,
 	splitNul,
 	pathKey,
 	displayPath,
@@ -40,8 +39,31 @@ import {
 	isInternalRpacPath,
 	isReviewMetadataPath,
 } from "./review.ts";
-import { nowIso } from "./util.ts";
+import { nowIso, shortId } from "./util.ts";
 import { gitInfo } from "./git.ts";
+
+// Native preparation must not execute branch-controlled checkout hooks or
+// fsmonitor scripts before source screening. Other installed Git helpers/filters
+// remain part of the trusted host toolchain; this is not a sandbox.
+export const PR_GIT_OPTIONS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] as const;
+const runGitBuffer = (root: string, args: string[], allowFailure = false): Buffer => {
+	try { return rawGitBuffer(root, [...PR_GIT_OPTIONS, ...args], allowFailure); }
+	catch (error) { throw new Error((error as Error).message.replace(/^git -c failed/, `git ${args[0] ?? "command"} failed`)); }
+};
+export const runPrGitText = (root: string, args: string[], allowFailure = false) => runGitBuffer(root, args, allowFailure).toString("utf8").trim();
+const runGitText = runPrGitText;
+function prGitEnvironment(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	const count = Number(env.GIT_CONFIG_COUNT ?? 0);
+	if (!Number.isSafeInteger(count) || count < 0 || count > 1024) throw new Error("Invalid inherited GIT_CONFIG_COUNT; native PR preparation cannot safely override Git hooks.");
+	// gh invokes Git internally, so use Git's supported environment config.
+	// Legacy inline parameters must not override these final safety settings.
+	delete env.GIT_CONFIG_PARAMETERS;
+	env.GIT_CONFIG_COUNT = String(count + 2);
+	env[`GIT_CONFIG_KEY_${count}`] = "core.hooksPath"; env[`GIT_CONFIG_VALUE_${count}`] = "/dev/null";
+	env[`GIT_CONFIG_KEY_${count + 1}`] = "core.fsmonitor"; env[`GIT_CONFIG_VALUE_${count + 1}`] = "false";
+	return env;
+}
 
 // ---------------------------------------------------------------------------
 // gh CLI access (injected for tests)
@@ -90,6 +112,7 @@ function runGh(args: string[], cwd?: string): { ok: boolean; out: string; err: s
 	try {
 		const out = execFileSync("gh", args, {
 			cwd,
+			env: prGitEnvironment(),
 			stdio: ["ignore", "pipe", "pipe"],
 			encoding: "utf8",
 			timeout: 120_000,
@@ -243,7 +266,7 @@ export function selectPrRemote(root: string, pr: ResolvedPr): string {
 }
 
 /** Porcelain v1 -z: XY SP path NUL [original-path NUL for R/C]. Both paths matter. */
-export function cleanPrStatus(output: Buffer, allowPresentation = false): boolean {
+export function cleanPrStatus(output: Buffer, allowPresentation = false, generatedPaths: readonly string[] = []): boolean {
 	// Only in-place evidence checks may ignore the dedicated preference file.
 	// Checkout preparation and worktree removal retain their stricter cleanliness.
 	const allowed = allowPresentation ? isReviewMetadataPath : isInternalRpacPath;
@@ -261,7 +284,9 @@ export function cleanPrStatus(output: Buffer, allowPresentation = false): boolea
 		const valid = (c: number) => c === 0x20 || "MADRCTU".includes(String.fromCharCode(c));
 		if (!((x === 0x3f && y === 0x3f) || (x === 0x21 && y === 0x21) ||
 			(valid(x) && valid(y) && (x !== 0x20 || y !== 0x20)))) return false;
-		if (!allowed(record.subarray(3))) return false;
+		const path = record.subarray(3);
+		const generated = x === 0x3f && y === 0x3f && generatedPaths.some(root => /^[A-Za-z0-9_.\/-]+\/$/.test(root) && !root.split("/").some(part => ["..", ".", ".git", ".pi"].includes(part)) && path.subarray(0, Buffer.byteLength(root)).equals(Buffer.from(root)));
+		if (!allowed(path) && !generated) return false;
 		if (x === 0x52 || x === 0x43 || y === 0x52 || y === 0x43) {
 			const original = records[++i];
 			if (!original?.length || !allowed(original)) return false;
@@ -272,7 +297,7 @@ export function cleanPrStatus(output: Buffer, allowPresentation = false): boolea
 
 /** Inspect the repository to decide whether a PR checkout is safe. */
 export function assessPrCheckout(root: string): CheckoutAssessment {
-	const info = gitInfo(root);
+	const info = gitInfo(root, PR_GIT_OPTIONS);
 	const remotes = runGitText(root, ["remote"], true);
 	const remoteNames = remotes ? remotes.split("\n").map((l) => l.trim()).filter(Boolean) : [];
 	const remote = remoteNames.includes("origin") ? "origin" : (remoteNames[0] ?? null);
@@ -456,6 +481,18 @@ export function prWorktreePath(root: string, number: number): string {
 	return join(dirname(root), `${basename(root)}-rpac-pr-${number}`);
 }
 
+/** Only the canonical sibling or an RPAC-generated collision suffix is eligible. */
+export function isPrWorktreeLocation(root: string, number: number, location: string): boolean {
+	const base = prWorktreePath(root, number);
+	return location === base || (location.startsWith(`${base}-`) && /^[a-f0-9]{8}$/.test(location.slice(base.length + 1)));
+}
+
+function registeredWorktreeLocations(root: string): Set<string> {
+	return new Set(splitNul(runGitBuffer(root, ["worktree", "list", "--porcelain", "-z"]))
+		.filter(record => record.subarray(0, 9).equals(Buffer.from("worktree ")))
+		.map(record => record.subarray(9).toString("utf8")));
+}
+
 export interface PrCheckoutOutcome {
 	strategy: "in-place" | "worktree";
 	location: string;
@@ -479,7 +516,7 @@ export function performPrCheckout(
 ): PrCheckoutOutcome {
 	if (strategy === "in-place") {
 		assertCleanCheckout(root, true);
-		const original = gitInfo(root);
+		const original = gitInfo(root, PR_GIT_OPTIONS);
 		try {
 			const output = gh.prCheckout(root, meta.number);
 			const head = runGitText(root, ["rev-parse", "HEAD"]);
@@ -501,9 +538,23 @@ export function performPrCheckout(
 	}
 
 	// worktree strategy
-	const location = prWorktreePath(root, meta.number);
+	const base = prWorktreePath(root, meta.number);
+	let location = base, retained = "";
+	if (!existsSync(base) && !isSymlink(base)) {
+		const registered = registeredWorktreeLocations(root);
+		if (registered.has(base)) {
+			// A missing directory does not make its index/reflog disposable.
+			// Keep even foreign/locked stale registrations and choose a fresh path.
+			for (let attempt = 0; attempt < 16; attempt++) {
+				const candidate = `${base}-${shortId()}`;
+				if (!registered.has(candidate) && !existsSync(candidate) && !isSymlink(candidate)) { location = candidate; break; }
+			}
+			if (location === base) throw new Error("Could not allocate an unused PR worktree location; no registrations were removed.");
+			retained = `Preserved missing worktree registration at ${base}; using fresh checkout ${location}.`;
+		}
+	}
 	if (existsSync(location) || isSymlink(location)) {
-		assertOwnedPrWorktree(root, meta.number, meta.headSha);
+		assertOwnedPrWorktree(root, meta.number, meta.headSha, location);
 		assertCleanCheckout(location);
 	} else {
 		const ref = `refs/rpac/pr/${meta.number}`;
@@ -524,7 +575,7 @@ export function performPrCheckout(
 		}
 		// Ownership is recorded in Git's administrative dir, never in reviewed files.
 		writeFileSync(ownerFile(location), JSON.stringify({ root: realpathSync(root), number: meta.number, head }), { flag: "wx" });
-		return { strategy, location, head, output: added };
+		return { strategy, location, head, output: [retained, added].filter(Boolean).join("\n") };
 	}
 	return { strategy, location, head: runGitText(location, ["rev-parse", "HEAD"]), output: "reused existing worktree" };
 }
@@ -538,13 +589,12 @@ function ownerFile(location: string): string {
 }
 
 /** Validate exact registered location, common repository, and RPAC ownership. */
-export function assertOwnedPrWorktree(root: string, number: number, expectedHead?: string): void {
-	const location = prWorktreePath(root, number);
+export function assertOwnedPrWorktree(root: string, number: number, expectedHead?: string, location = prWorktreePath(root, number)): void {
+	if (!isPrWorktreeLocation(root, number, location)) throw new Error("PR worktree ownership check failed: unexpected checkout location");
 	if (isSymlink(location) || !existsSync(location) || realpathSync(location) !== resolve(location)) {
 		throw new Error("PR worktree ownership check failed: missing or symlinked location");
 	}
-	const records = splitNul(runGitBuffer(root, ["worktree", "list", "--porcelain", "-z"]));
-	if (!records.some(r => r.equals(Buffer.from(`worktree ${location}`)))) {
+	if (!registeredWorktreeLocations(root).has(location)) {
 		throw new Error("PR location is not a registered worktree of this repository");
 	}
 	const common = (path: string) => realpathSync(runGitText(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
@@ -573,25 +623,31 @@ function assertCleanCheckout(location: string, allowRpacState = false): void {
 }
 
 /** No force, no filesystem fallback, and no pruning unrelated worktrees. */
-export function removePrWorktree(root: string, number: number, expectedHead?: string): string {
-	const location = prWorktreePath(root, number);
-	if (!existsSync(location) && !isSymlink(location)) return "no worktree to remove";
-	assertOwnedPrWorktree(root, number, expectedHead);
+export function removePrWorktree(root: string, number: number, expectedHead?: string, location = prWorktreePath(root, number)): string {
+	if (!isPrWorktreeLocation(root, number, location)) throw new Error("PR worktree ownership check failed: unexpected cleanup location");
+	if (!existsSync(location) && !isSymlink(location)) return registeredWorktreeLocations(root).has(location)
+		? `Worktree directory is missing; its registration is retained at ${location}. No metadata was deleted. A fresh preview can use a new checkout.`
+		: "no worktree to remove";
+	assertOwnedPrWorktree(root, number, expectedHead, location);
 	assertCleanCheckout(location);
 	runGitText(root, ["worktree", "remove", location]);
 	return `removed PR worktree at ${location}`;
 }
 
 /** Verify that build/test evidence would come from the pinned, uncontaminated checkout. */
-export function assertPrCheckout(root: string, pr: PrReviewMeta): void {
+export function assertPrCheckout(root: string, pr: PrReviewMeta, generatedPaths: readonly string[] = []): void {
 	if (pr.checkoutStrategy === "worktree") {
-		if (pr.checkoutLocation !== prWorktreePath(root, pr.number)) throw new Error("PR checkout location does not match its owned worktree");
-		assertOwnedPrWorktree(root, pr.number, pr.headSha);
+		if (!isPrWorktreeLocation(root, pr.number, pr.checkoutLocation)) throw new Error("PR checkout location does not match its owned worktree");
+		assertOwnedPrWorktree(root, pr.number, pr.headSha, pr.checkoutLocation);
 	} else if (resolve(pr.checkoutLocation) !== resolve(root)) throw new Error("PR in-place checkout location is invalid");
 	if (runGitText(pr.checkoutLocation, ["rev-parse", "HEAD"]) !== pr.headSha) throw new Error("PR checkout HEAD differs from the reviewed commit");
 	if (hasHiddenIndexEntries(pr.checkoutLocation)) throw new Error("PR checkout index hides potential local changes; verification evidence is untrusted");
+	for (const output of generatedPaths) {
+		let current = pr.checkoutLocation;
+		for (const part of output.split("/").filter(Boolean)) { current = join(current, part); if (isSymlink(current)) throw new Error("Approved output directory is symlinked; verification evidence is untrusted"); }
+	}
 	const status = runGitBuffer(pr.checkoutLocation, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]);
-	if (!cleanPrStatus(status, pr.checkoutStrategy === "in-place" && resolve(root) === resolve(pr.checkoutLocation))) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
+	if (!cleanPrStatus(status, pr.checkoutStrategy === "in-place" && resolve(root) === resolve(pr.checkoutLocation), generatedPaths)) throw new Error("PR checkout contains uncommitted or untracked changes; verification evidence is stale");
 }
 
 /** Re-resolve the current PR head SHA (for force-push / drift detection). */

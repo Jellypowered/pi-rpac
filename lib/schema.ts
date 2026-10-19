@@ -1,9 +1,15 @@
 // RPAC workflow state — schema, types, validation. Pure (node builtins only).
 //
+// Version 4: fail-closed PR execution profiles (shared index remains version 3).
 // Version 3: workflow kinds and durable review snapshot/coverage metadata.
 // Version 2 introduced per-workflow storage and explicit task outcomes.
 
+import { parseHostExecution, type HostExecution } from "./execution.ts";
+
 export const RPAC_STATE_VERSION = 3;
+/** Host execution is security-sensitive: older v3 engines must refuse these workflows.
+ * Keep the index at v3 so older engines retain the active pointer and fail closed. */
+export const RPAC_PREVIEW_STATE_VERSION = 4;
 
 export const RPAC_PHASES = ["refine", "plan", "act", "consolidate", "done", "aborted"] as const;
 export type RpacPhase = (typeof RPAC_PHASES)[number];
@@ -72,6 +78,8 @@ export interface RpacReviewState {
 	coveredItemIds: string[];
 	uncoveredItemIds: string[];
 	approvedChecks: string[];
+	/** Optional v1 screened host-execution lane. Missing in older review records. */
+	execution?: HostExecution;
 	exclusions: { path: string; reason: string }[];
 	/** GitHub PR review metadata; present exactly when mode is "pr". */
 	pr?: PrReviewMeta;
@@ -368,21 +376,24 @@ export function validateTaskGraph(deps: (number[] | undefined)[], n: number): vo
 export function validateState(raw: unknown, expectedProject?: string): RpacState {
 	if (!isRecord(raw)) throw new RpacStateError("corrupt", "workflow.json is not a JSON object");
 
-	if (typeof raw.version === "number" && raw.version > RPAC_STATE_VERSION) {
+	if (typeof raw.version === "number" && raw.version > RPAC_PREVIEW_STATE_VERSION) {
 		throw new RpacStateError(
 			"unsupported_version",
-			`workflow state version ${raw.version} is newer than the supported version ${RPAC_STATE_VERSION} — refusing to touch it`,
+			`workflow state version ${raw.version} is newer than the supported workflow version ${RPAC_PREVIEW_STATE_VERSION} — refusing to touch it`,
 		);
 	}
 	// Versions 1 (shared layout) and 2 (pre-review per-workflow layout) are
 	// accepted and normalized; older binaries reject v3 rather than dropping
 	// review metadata on save.
-	if (raw.version !== 1 && raw.version !== 2 && raw.version !== RPAC_STATE_VERSION) {
+	if (raw.version !== 1 && raw.version !== 2 && raw.version !== RPAC_STATE_VERSION && raw.version !== RPAC_PREVIEW_STATE_VERSION) {
 		throw new RpacStateError(
 			"unsupported_version",
 			`unsupported workflow state version ${String(raw.version ?? "?")} (expected ${RPAC_STATE_VERSION})`,
 		);
 	}
+	const hostProfile = raw.workflowKind === "review" && isRecord(raw.review) && raw.review.execution !== undefined;
+	if ((raw.version === RPAC_PREVIEW_STATE_VERSION) !== hostProfile) throw new RpacStateError("unsupported_version", "Screened preview execution requires workflow version 4; ordinary workflows and the index remain version 3.");
+	if (hostProfile && isRecord(raw.review) && isRecord(raw.review.execution) && typeof raw.review.execution.version === "number" && raw.review.execution.version > 1) throw new RpacStateError("unsupported_version", "Host-execution profile is newer than this engine supports; refusing to discard approval metadata.");
 	if (!isString(raw.id) || !raw.id) throw new RpacStateError("corrupt", "missing workflow id");
 	if (!isString(raw.project) || !raw.project) {
 		throw new RpacStateError("corrupt", "missing project root");
@@ -406,7 +417,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 	}
 	const workflowKind: WorkflowKind = isString(raw.workflowKind) ? raw.workflowKind as WorkflowKind : "implementation";
 	const state: RpacState = {
-		version: RPAC_STATE_VERSION,
+		version: hostProfile ? RPAC_PREVIEW_STATE_VERSION : RPAC_STATE_VERSION,
 		workflowKind,
 		id: raw.id,
 		project: raw.project,
@@ -596,6 +607,7 @@ export function validateState(raw: unknown, expectedProject?: string): RpacState
 			coveredItemIds: [...new Set(review.coveredItemIds as string[])],
 			uncoveredItemIds: [...new Set(review.uncoveredItemIds as string[])],
 			approvedChecks: [...new Set(review.approvedChecks as string[])],
+			...(review.execution === undefined ? {} : { execution: (() => { try { return parseHostExecution(review.execution); } catch (error) { throw new RpacStateError("corrupt", (error as Error).message); } })() }),
 			exclusions,
 			...(pr ? { pr } : {}),
 		};

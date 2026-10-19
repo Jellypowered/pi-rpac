@@ -27,14 +27,14 @@ function runGit(root: string, args: string[]): string | null {
 }
 
 /** Snapshot the git working tree. `root` is the project root (git toplevel when in a repo). */
-export function gitInfo(root: string): GitInfo {
-	const topLevel = runGit(root, ["rev-parse", "--show-toplevel"])?.trim();
+export function gitInfo(root: string, gitOptions: readonly string[] = []): GitInfo {
+	const topLevel = runGit(root, [...gitOptions, "rev-parse", "--show-toplevel"])?.trim();
 	if (!topLevel) {
 		return { isRepo: false, root: null, head: "", branch: "", dirty: [] };
 	}
-	const head = runGit(topLevel, ["rev-parse", "HEAD"])?.trim() ?? "";
-	const branch = runGit(topLevel, ["branch", "--show-current"])?.trim() ?? "";
-	const status = runGit(topLevel, ["status", "--porcelain"]);
+	const head = runGit(topLevel, [...gitOptions, "rev-parse", "HEAD"])?.trim() ?? "";
+	const branch = runGit(topLevel, [...gitOptions, "branch", "--show-current"])?.trim() ?? "";
+	const status = runGit(topLevel, [...gitOptions, "status", "--porcelain"]);
 	const dirty: string[] = [];
 	if (status) {
 		for (const line of status.split("\n")) {
@@ -51,8 +51,8 @@ export function gitInfo(root: string): GitInfo {
 }
 
 /** Capture a workflow baseline from the current working tree. */
-export function captureBaseline(root: string): RpacBaseline | undefined {
-	const info = gitInfo(root);
+export function captureBaseline(root: string, gitOptions: readonly string[] = []): RpacBaseline | undefined {
+	const info = gitInfo(root, gitOptions);
 	if (!info.isRepo) return undefined;
 	return { head: info.head, branch: info.branch, dirty: info.dirty, createdAt: nowIso() };
 }
@@ -79,7 +79,7 @@ export interface Divergence {
  * Changes under `.pi/rpac/` are expected (RPAC writes its own state) and are
  * counted separately rather than reported as divergence.
  */
-export function detectDivergence(root: string, baseline: RpacBaseline | undefined): Divergence {
+export function detectDivergence(root: string, baseline: RpacBaseline | undefined, gitOptions: readonly string[] = []): Divergence {
 	if (!baseline) {
 		return {
 			noBaseline: true,
@@ -91,7 +91,7 @@ export function detectDivergence(root: string, baseline: RpacBaseline | undefine
 			summary: "no git baseline recorded",
 		};
 	}
-	const info = gitInfo(root);
+	const info = gitInfo(root, gitOptions);
 	if (!info.isRepo) {
 		return {
 			noBaseline: false,

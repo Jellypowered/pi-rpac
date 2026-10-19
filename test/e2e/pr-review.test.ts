@@ -5,7 +5,8 @@
 // guarantee that no unauthorized GitHub mutation is ever attempted.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import type { ExecutionInput } from "../../lib/execution.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname, sep, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -186,7 +187,7 @@ const PLAN = [
 ].join("\n");
 
 /** Drive a fresh PR review (refine) through refine→plan approval to the act phase. */
-async function driveToAct(m: MockPi, work: string, checkOverride?: string): Promise<{ id: string; itemIds: string[] }> {
+async function driveToAct(m: MockPi, work: string, checkOverride?: string, reviewExecution?: ExecutionInput): Promise<{ id: string; itemIds: string[] }> {
 	const id = activeWorkflowId(work);
 	writeArtifact(work, "requirements", REQ, id);
 	await rpacTool(m, work, { action: "refine_complete" }, { confirm: [true] });
@@ -201,9 +202,169 @@ async function driveToAct(m: MockPi, work: string, checkOverride?: string): Prom
 			{ title: "Validate findings and coverage", dependsOn: [1] },
 		],
 		reviewChecks: [check],
+		...(reviewExecution ? { reviewExecution } : {}),
 	}, { confirm: [true] });
 	return { id, itemIds };
 }
+
+test("standalone preview uses a separate checkout even for a clean repository and rejects unknown flags", async () => {
+ const env = setupPrEnv(), m = makeMockPi();
+ try {
+  rpacExtension(extensionApiFor(m));
+  const original = git(env.work, "rev-parse", "HEAD");
+  const invalid = await rpacCmd(m, env.work, "preview 1 --unsafe");
+  assert.match(invalid.ui.text("error").join("\n"), /Use \/rpac preview/);
+  const started = await rpacCmd(m, env.work, "preview 1");
+  assert.equal(started.ui.text("error").length, 0);
+  const state = readState(env.work);
+  assert.equal(state.review.pr.checkoutStrategy, "worktree");
+  assert.notEqual(state.review.pr.checkoutLocation, env.work);
+  assert.equal(git(env.work, "rev-parse", "HEAD"), original);
+  assert.equal(state.review.execution.approval, undefined);
+  const completions = await m.commands.get("rpac")!.getArgumentCompletions!("prev") as { value: string }[];
+  assert.ok(completions.some(item => item.value === "preview"));
+  assertNoGhMutations(env.ghCalls());
+ } finally { env.cleanup(); }
+});
+
+test("native preview preparation suppresses branch-controlled checkout and fsmonitor hooks", async () => {
+ for (const command of ["preview 1", "start preview 1"]) {
+  const env = setupPrEnv(), m = makeMockPi(), marker = join(env.work, ".git", "unexpected-hook-run");
+  try {
+   git(env.origin, "checkout", "feature"); mkdirSync(join(env.origin, ".pr-hooks"));
+   for (const name of ["post-checkout", "fsmonitor"]) {
+    const path = join(env.origin, ".pr-hooks", name);
+    writeFileSync(path, `#!/bin/sh\nprintf ran >> '${marker}'\nprintf '\\0'\n`); chmodSync(path, 0o755);
+   }
+   git(env.origin, "add", "."); git(env.origin, "commit", "-qm", "branch controlled hook fixtures");
+   const head = git(env.origin, "rev-parse", "HEAD"); git(env.origin, "update-ref", "refs/pull/1/head", head); git(env.origin, "checkout", env.baseRef);
+   env.setView({ ...env.view, headRefOid: head });
+   git(env.work, "config", "core.hooksPath", ".pr-hooks"); git(env.work, "config", "core.fsmonitor", ".pr-hooks/fsmonitor");
+   rpacExtension(extensionApiFor(m)); const started = await rpacCmd(m, env.work, command);
+   assert.equal(started.ui.text("error").length, 0, started.ui.text("error").join("\n"));
+   assert.equal(readState(env.work).phase, "refine");
+   assert.equal(existsSync(marker), false, `${command} must not execute PR hooks before screening`);
+   // Positive control: this trusted fixture really executes under ordinary Git.
+   git(readState(env.work).review.pr.checkoutLocation, "status", "--porcelain");
+   assert.ok(existsSync(marker), "ordinary Git still trusts configured host plugins; RPAC is not an OS sandbox");
+  } finally { env.cleanup(); }
+ }
+});
+
+test("preview survives a manually deleted registered directory and cleans up only its recorded fresh checkout", async () => {
+ const env = setupPrEnv(), m = makeMockPi();
+ try {
+  rpacExtension(extensionApiFor(m)); await rpacCmd(m, env.work, "preview 1");
+  const first = readState(env.work).review.pr.checkoutLocation;
+  const admin = git(first, "rev-parse", "--absolute-git-dir");
+  writeFileSync(join(first, "a.txt"), "staged evidence worth preserving\n"); git(first, "add", "a.txt");
+  const index = readFileSync(join(admin, "index"));
+  removeTree(first); // reproduce manual deletion, without unregistering Git metadata
+  const started = await rpacCmd(m, env.work, "preview 1 --yes", { hasUI: false });
+  assert.equal(started.ui.text("error").length, 0, started.ui.text("error").join("\n"));
+  const fresh = readState(env.work).review.pr.checkoutLocation;
+  assert.notEqual(fresh, first); assert.ok(fresh.startsWith(first + "-"));
+  assert.deepEqual(readFileSync(join(admin, "index")), index);
+  await driveToAct(m, env.work, prCheckPrefix(fresh) + "node --version");
+  const act = await rpacCmd(m, env.work, "act");
+  assert.equal(act.ui.text("error").length, 0, act.ui.text("error").join("\n"));
+  await fire(m, "agent_end", {}, makeCommandCtx(m, env.work) as never);
+  const cleanup = await rpacCmd(m, env.work, "pr-cleanup --yes", { hasUI: false });
+  assert.equal(cleanup.ui.text("error").length, 0, cleanup.ui.text("error").join("\n"));
+  assert.equal(existsSync(fresh), false);
+  assert.ok(existsSync(admin), "old registration and staged index are not silently pruned");
+  assert.deepEqual(readFileSync(join(admin, "index")), index);
+ } finally { env.cleanup(); }
+});
+
+test("preview rejects impossible checks and contradictory written assignments before approval", async () => {
+ const env = setupPrEnv(), m = makeMockPi();
+ try {
+  rpacExtension(extensionApiFor(m)); await rpacCmd(m, env.work, "preview 1");
+  const id = activeWorkflowId(env.work), state = readState(env.work);
+  writeArtifact(env.work, "requirements", REQ, id);
+  await rpacTool(m, env.work, { action: "refine_complete" }, { confirm: [true] });
+  writeArtifact(env.work, "plan", PLAN, id);
+  const tasks = [{ title: "Review all", reviewItemIds: state.review.scopeItemIds }];
+  const prefix = prCheckPrefix(state.review.pr.checkoutLocation);
+  assert.match(await rpacTool(m, env.work, { action: "plan_complete", tasks, reviewChecks: [prefix + "npm ci && npm test"] }), /setupCommands|Installs|unsupported/);
+  assert.match(await rpacTool(m, env.work, { action: "plan_complete", tasks, reviewChecks: [prefix + "npm test"] }), /without script screening/);
+  assert.equal(readState(env.work).approvals.plan, false);
+  assert.equal(readState(env.work).tasks.length, 0);
+  writeArtifact(env.work, "plan", PLAN + `\n### Task 1 — Review all\nAssigned manifest items:\n- ${state.review.scopeItemIds[0]}\n\n`, id);
+  assert.match(await rpacTool(m, env.work, { action: "plan_complete", tasks, reviewChecks: [prefix + "node --version"] }), /different manifest items/);
+  assert.equal(readState(env.work).approvals.plan, false);
+ } finally { env.cleanup(); }
+});
+
+test("screened setup and failed checks record real outcomes, permit declared generated files and cannot be hidden at task completion", async () => {
+ const env = setupPrEnv(), m = makeMockPi();
+ try {
+  git(env.origin, "checkout", "feature");
+  writeFileSync(join(env.origin, "package.json"), JSON.stringify({ scripts: { test: "node verify.cjs" } }));
+  writeFileSync(join(env.origin, "package-lock.json"), "{}\n");
+  writeFileSync(join(env.origin, "verify.cjs"), "const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/result.txt','fixture'); console.log('offline='+process.env.npm_config_offline); console.error('fixture failed check'); process.exit(4);\n");
+  git(env.origin, "add", "."); git(env.origin, "commit", "-qm", "host runner fixture");
+  const head = git(env.origin, "rev-parse", "HEAD"); git(env.origin, "update-ref", "refs/pull/1/head", head); git(env.origin, "checkout", env.baseRef);
+  env.setView({ ...env.view, headRefOid: head });
+  const api = extensionApiFor(m); let executions = 0;
+  api.exec = async (exe: string, args: string[], options: { cwd: string }) => {
+   executions++;
+   if (args.at(-1)?.includes("npm ci")) { // deterministic setup fixture; never contact a registry in this test
+    mkdirSync(join(options.cwd, "node_modules")); writeFileSync(join(options.cwd, "node_modules", "fixture-ready"), "ready");
+    return { stdout: "simulated setup\n", stderr: "", code: 0, killed: false };
+   }
+   const output = spawnSync(exe, args, { cwd: options.cwd, encoding: "utf8" });
+   return { stdout: output.stdout ?? "", stderr: output.stderr ?? "", code: output.status ?? -1, killed: !!output.signal };
+  };
+  rpacExtension(api); await rpacCmd(m, env.work, "preview 1");
+  let state = readState(env.work); const wt = state.review.pr.checkoutLocation, prefix = prCheckPrefix(wt);
+  const check = prefix + "node verify.cjs", setup = prefix + "npm ci --ignore-scripts --no-audit --no-fund";
+  await driveToAct(m, env.work, check, { setupCommands: [setup], generatedPaths: ["node_modules/", "dist/"], screening: { summary: "Inspected the package scripts, lockfile and verify.cjs. The fixture writes only a dist result, prints the offline hint and intentionally exits four. Setup is simulated in this harness; arbitrary host or dependency code is not sandboxed.", files: ["package.json", "package-lock.json", "verify.cjs"], risks: ["A separate worktree does not isolate host files, shared Git, credentials or network. Dependency lifecycle code remains unproven."], recommendation: "run" } });
+  await rpacCmd(m, env.work, "act");
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: check }), /not been approved/);
+  assert.equal(executions, 0);
+  await fire(m, "agent_end", {}, makeCommandCtx(m, env.work) as never);
+  const noYes = await rpacCmd(m, env.work, "approve execution", { hasUI: false });
+  assert.match(noYes.ui.text("error").join("\n"), /NOT a sandbox/);
+  assert.equal(readState(env.work).review.execution.approval, undefined);
+  await rpacCmd(m, env.work, "approve execution --yes", { hasUI: false });
+  const approved = readState(env.work).review.execution.approval;
+  assert.ok(existsSync(join(env.work, approved.record.path)));
+  await rpacCmd(m, env.work, "act 1");
+  const foreign = makeMockPi(), foreignApi = extensionApiFor(foreign); let foreignExecutions = 0;
+  foreignApi.exec = async () => { foreignExecutions++; throw new Error("foreign runtime must never execute code"); };
+  rpacExtension(foreignApi);
+  assert.match(await rpacTool(foreign, env.work, { action: "review_check", command: check }), /runtime does not own.*execution lease/);
+  assert.match(await rpacTool(foreign, env.work, { action: "task_done", task: 1, verification: [{ name: "invented", result: "pass" }] }), /runtime does not own.*execution lease/);
+  const foreignWrite = await fire(foreign, "tool_call", { toolName: "write", input: { path: join(workflowDirPath(env.work), "review-batch-1.md"), content: "not authorized" } }, makeCommandCtx(foreign, env.work) as never) as { block: boolean };
+  assert.equal(foreignWrite.block, true);
+  await fire(foreign, "agent_end", {}, makeCommandCtx(foreign, env.work) as never);
+  await fire(foreign, "session_shutdown", {}, makeCommandCtx(foreign, env.work) as never);
+  assert.equal(foreignExecutions, 0);
+  assert.equal(readState(env.work).review.execution.runs.length, 0);
+  assert.equal(readState(env.work).tasks[0].status, "in_progress", "another runtime cannot interrupt the owning task");
+  assert.ok(existsSync(join(env.work, ".pi", "rpac", ".act-lease")), "another runtime cannot release the owning lease");
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: check }), /setup commands first/);
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: setup, checkKind: "setup" }), /result: pass; exit 0/);
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: setup, checkKind: "setup" }), /already completed/);
+  assert.equal(executions, 1, "successful setup is not blindly repeated");
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: check }), /result: fail; exit 4/);
+  state = readState(env.work);
+  assert.equal(state.review.drift, undefined, "declared untracked generated output is not source drift");
+  const run = state.review.execution.runs[1], logfile = readFileSync(join(env.work, run.output.path), "utf8");
+  assert.match(logfile, /Exit code: 4/); assert.match(logfile, /offline=true/); assert.match(logfile, /fixture failed check/);
+  const batch = join(workflowDirPath(env.work), "review-batch-1.md"); writeFileSync(batch, "# Batch\nFixture check outcomes and assigned evidence were captured.\n");
+  const base = { action: "task_done", task: 1, deliverables: [batch], verification: [{ name: "coverage captured", result: "pass" }] };
+  assert.match(await rpacTool(m, env.work, base), /actual pass host observation/);
+  const observations = state.review.execution.runs.map((entry: any) => ({ name: entry.command, kind: "observation", result: entry.result, detail: `exit ${entry.exitCode}; log ${entry.output.path}` }));
+  assert.match(await rpacTool(m, env.work, { ...base, verification: [...base.verification, ...observations] }), /complete/);
+  assert.equal(readState(env.work).tasks[0].verification.filter((entry: any) => entry.result === "fail").length, 1);
+  await fire(m, "agent_end", {}, makeCommandCtx(m, env.work) as never);
+  const cleanup = await rpacCmd(m, env.work, "pr-cleanup");
+  assert.match(cleanup.ui.text("error").join("\n"), /untracked|ignored|dirty/, "execution permission never silently discards generated files during cleanup");
+ } finally { env.cleanup(); }
+});
 
 test("PR review happy path: in-place checkout, full lifecycle, report-only, no gh mutations", async () => {
 	const env = setupPrEnv();
@@ -520,18 +681,36 @@ test("approved PR check executes in the isolated worktree, not the dirty origina
   const head = git(env.origin, "rev-parse", "HEAD"); git(env.origin, "update-ref", "refs/pull/1/head", head); git(env.origin, "checkout", env.baseRef);
   env.setView({ ...env.view, headRefOid: head });
   writeFileSync(join(env.work, "app.txt"), "dirty original — must not test this\n");
-  rpacExtension(extensionApiFor(m)); await rpacCmd(m, env.work, "start preview 1");
+  const api = extensionApiFor(m);
+  let executions = 0;
+  api.exec = async (exe: string, args: string[], options: { cwd: string }) => {
+   executions++;
+   const result = spawnSync(exe, args, { cwd: options.cwd, encoding: "utf8" });
+   return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? -1, killed: !!result.signal };
+  };
+  rpacExtension(api); await rpacCmd(m, env.work, "preview 1");
   const s = readState(env.work); const wt = s.review.pr.checkoutLocation;
   const check = `${prCheckPrefix(wt)}node verify.cjs`;
-  await driveToAct(m, env.work, check); await rpacCmd(m, env.work, "act");
+  await driveToAct(m, env.work, check, { generatedPaths: ["build/"], screening: { summary: "Inspected verify.cjs and its only file read of app.txt. It asserts the pinned PR content and prints its working directory; there are no writes, external commands or network requests in this fixture.", files: ["verify.cjs"], risks: ["Host execution is not a sandbox; a real PR or dependency could access host files and credentials."], recommendation: "run" } });
+  const declined = await rpacCmd(m, env.work, "approve execution", { confirm: [false] });
+  assert.match(declined.ui.text("error").join("\n"), /not approved/);
+  assert.equal(executions, 0);
+  await rpacCmd(m, env.work, "approve execution --yes", { hasUI: false });
+  await rpacCmd(m, env.work, "act");
   const gate = (command: string) => fire(m, "tool_call", { toolName: "bash", input: { command } }, { cwd: env.work }) as Promise<{ block?: boolean } | undefined>;
   assert.ok((await gate("node verify.cjs"))?.block, "bare command must not run in original cwd");
   assert.ok((await gate(`${prCheckPrefix(env.work)}node verify.cjs`))?.block, "wrong checkout prefix blocked");
-  assert.equal((await gate(check))?.block, undefined);
-  assert.equal(execFileSync("bash", ["-c", check], { cwd: env.work, encoding: "utf8" }).trim(), wt);
+  assert.ok((await gate(check))?.block, "approved host scripts must use the recorded native runner, not raw bash");
+  const executed = await rpacTool(m, env.work, { action: "review_check", command: check });
+  assert.match(executed, /result: pass; exit 0/);
+  assert.equal(executions, 1);
+  const outcome = readState(env.work).review.execution.runs[0];
+  assert.ok(readFileSync(join(env.work, outcome.output.path), "utf8").includes(wt));
   assert.equal(readFileSync(join(env.work, "app.txt"), "utf8"), "dirty original — must not test this\n");
   writeFileSync(join(wt, "app.txt"), "contaminated checkout\n");
   assert.ok((await gate(check))?.block, "modified checkout cannot produce approved PR verification evidence");
+  assert.match(await rpacTool(m, env.work, { action: "review_check", command: check }), /uncommitted|changed/);
+  assert.equal(executions, 1, "contamination prevents another host dispatch");
  } finally { env.cleanup(); }
 });
 

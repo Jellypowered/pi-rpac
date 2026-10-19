@@ -336,7 +336,7 @@ test("sequential execution continues only after a verified pass", async () => {
 		verification: [{ name: "check", result: "pass" }],
 		deliverables: [deliverable],
 	});
-	assert.match(out, /Continue with the next ready task/, "verified pass continues sequential mode");
+	assert.match(out, /Before any work.*task_start.*task "next"/, "verified pass continues sequential mode");
 	assert.equal(state().tasks[0]!.deliverables?.[0]?.path, `.pi/rpac/${activeWorkflowId(repo)}/review.md`);
 	assert.equal(state().tasks[0]!.deliverables?.[0]?.sha256, sha256File(deliverable));
 	writeFileSync(deliverable, "changed after task completion\n", "utf8");
@@ -488,7 +488,7 @@ test("concurrent ACT refusal: a live lease blocks /rpac act", async () => {
 	assert.ok(existsSync(join(repo, ".pi", "rpac", ".act-lease")), "execution lease held");
 	// a second act while the first model run is still going (no settle) must refuse
 	const act2 = await rpacCmd(m, repo, "act");
-	assert.match(act2.ui.text("error").join("\n"), /already being executed by this Pi session/);
+	assert.match(act2.ui.text("error").join("\n"), /already being executed by this Pi process/);
 	// the lease is released when the run ends
 	await settle();
 	const act3 = await rpacCmd(m, repo, "act 1");
@@ -613,9 +613,12 @@ test("stale artifact + git divergence are reported on act and resume", async () 
 	// act reports the drift as a warning and logs it
 	const act = await rpacCmd(m, repo, "act 1");
 	assert.match(act.ui.text("warning").join("\n"), /requirements artifact changed/);
+	await settle(); // the owning run must finish before a fresh resume can dispatch
 	// resume reports it too
 	const res = await rpacCmd(m, repo, "resume");
 	assert.match(res.ui.text("warning").join("\n"), /requirements artifact changed/);
+	assert.equal(res.ui.text("error").length, 0, "resume actually dispatched rather than merely reporting staleness before a lease refusal");
+	await settle();
 	// RPAC's own state churn is NOT reported as git divergence
 	const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
 	const st = await rpacCmd(m, repo, "status --details");
@@ -664,7 +667,7 @@ test("extension reload + session resume: a fresh runtime sees the same workflow"
 			setWidget(_k: string, _v: string[] | undefined) {},
 		} as never,
 	});
-	// session_shutdown clears UI and releases the lease (no crash)
+	// session_shutdown clears this runtime's UI, never another runtime's lease
 	const shutdownHandlers = m2.handlers.get("session_shutdown") ?? [];
 	await shutdownHandlers[0]({ type: "session_shutdown" } as never, {
 		cwd: repo,

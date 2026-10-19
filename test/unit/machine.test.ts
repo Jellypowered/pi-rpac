@@ -449,7 +449,7 @@ test("sequential stop semantics: only a verified done continues", () => {
 	taskStart(s2);
 	const ok = taskDone(s2, 1, [{ name: "unit", result: "pass" }]);
 	assert.equal(ok.stopSequential, undefined);
-	assert.match(ok.message, /Continue with the next ready task/);
+	assert.match(ok.message, /Before any work.*task_start.*task "next"/);
 	// blocked → stop
 	const s3 = approvedPlanState();
 	s3.approvals.sequential = true;

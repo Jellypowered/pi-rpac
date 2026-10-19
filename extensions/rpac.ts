@@ -23,6 +23,8 @@ import type {
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveStyle, stylePaths, parseStyleCommand, saveStylePreference, styleReport, styleCompletions, styleInstruction } from "../lib/styles.ts";
 import { progressMessage, statusOpening, nextStep, conversationalStatus, humanError, approvalExplanation } from "../lib/presentation.ts";
+import { validateReviewAssignments } from "../lib/review-plan.ts";
+import { prepareHostExecution, assertScreeningCurrent, assertHostApproval, executionDigest, hostApprovalText, requireRuntimeEvidence } from "../lib/execution.ts";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -34,6 +36,7 @@ import {
 	type PrReviewMeta,
 	REVIEW_MODES,
 	PR_REVIEW_MODE,
+	RPAC_PREVIEW_STATE_VERSION,
 	RpacStateError,
 	newReviewState,
 	newState,
@@ -82,15 +85,16 @@ import {
 } from "../lib/store.ts";
 import { RpacLockError, acquireLock, isPidAlive, readLockRecord, refreshLock, releaseLock, holdsLock } from "../lib/lock.ts";
 import { captureBaseline, detectDivergence, gitInfo } from "../lib/git.ts";
-import { runGitText } from "../lib/review.ts";
 import { captureReviewSnapshot, compareReviewSnapshots, type ReviewExclusion, type ReviewSnapshot } from "../lib/review.ts";
 import {
 	assessPrCheckout,
+	PR_GIT_OPTIONS,
+	runPrGitText,
 	buildPrMeta,
 	capturePrSnapshot,
 	defaultGhRunner,
 	performPrCheckout,
-	prWorktreePath,
+	isPrWorktreeLocation,
 	prRestoreCommand,
 	removePrWorktree,
 	selectPrRemote,
@@ -110,8 +114,8 @@ import {
 	reviewReportFile,
 	workflowDir,
 } from "../lib/paths.ts";
-import { gateToolCall, gateUnreadableState, hasPrCheckDirectory, isApprovedReviewCheck, prCheckPrefix } from "../lib/gating.ts";
-import { atomicWriteFile, nowIso, projectRoot, sha256File } from "../lib/util.ts";
+import { gateToolCall, gateUnreadableState, hasPrCheckDirectory, isApprovedReviewCheck, isReadOnlyCommand, hostCommandIssue, prCheckPrefix } from "../lib/gating.ts";
+import { atomicWriteFile, nowIso, projectRoot, sha256File, shortId } from "../lib/util.ts";
 import {
 	actDirective,
 	consolidateDirective,
@@ -290,6 +294,13 @@ function statusReport(root: string, details = false): string {
 		);
 		if (coverage.uncovered.length) lines.push(`Uncovered review items: ${coverage.uncovered.join(", ")}`);
 		for (const check of state.review.approvedChecks) lines.push(`Approved review check: ${check}`);
+		if (state.review.execution) {
+			const execution = state.review.execution;
+			lines.push(`Host execution: ${execution.screening ? `screened (${execution.screening.recommendation})` : "not screened"}; separate user approval ${execution.approval ? "recorded (revalidated before each dispatch)" : "required"}; NOT sandboxed`);
+			for (const command of execution.setupCommands) lines.push(`Setup command: ${command}`);
+			for (const output of execution.generatedPaths) lines.push(`Permitted untracked generated directory: ${output}`);
+			for (const outcome of execution.runs) lines.push(`Host ${outcome.kind}: ${outcome.command} — ${outcome.result}; exit ${outcome.exitCode ?? "unavailable"}${outcome.output ? `; log ${outcome.output.path} (${outcome.output.sha256})` : ""}${outcome.detail ? `; ${outcome.detail}` : ""}`);
+		}
 		if (state.review.pr) {
 			const pr = state.review.pr;
 			lines.push(`PR: #${pr.number} ${pr.url} (${pr.state}${pr.crossRepository ? ", fork" : ""})`);
@@ -304,7 +315,7 @@ function statusReport(root: string, details = false): string {
 	}
 	for (const note of stalenessNotes(root, state).filter((n) => !n.startsWith("git:"))) lines.push(`Stale: ${note}`);
 	if (state.baseline) {
-		const div = detectDivergence(root, state.baseline);
+		const div = detectDivergence(root, state.baseline, state.review?.pr ? PR_GIT_OPTIONS : []);
 		lines.push(`Git: ${state.baseline.branch || "(detached)"} @ ${state.baseline.head} (baseline ${state.baseline.dirty.length} dirty) — ${div.summary}`);
 	}
 	const lease = readLockRecord(root, LEASE_NAME);
@@ -435,7 +446,7 @@ function recheckPrSnapshot(root: string, state: RpacState, gh: GhRunner): string
 	} catch (err) {
 		note += ` could not re-resolve the PR identity/base/head: ${(err as Error).message}; freshness is unverified`;
 	}
-	try { assertPrCheckout(root, pr); }
+	try { assertPrCheckout(root, pr, state.review!.execution?.generatedPaths ?? []); }
 	catch (err) { note += ` checkout verification failed: ${(err as Error).message}`; }
 	if (note) {
 		added = [];
@@ -576,7 +587,11 @@ function stalenessNotes(root: string, state: RpacState): string[] {
 			else if (sha !== artifact.sha256) notes.push(`${label} deliverable changed since it was recorded (${artifact.path})`);
 		}
 	}
-	const div = detectDivergence(root, state.baseline);
+	for (const run of state.review?.execution?.runs ?? []) {
+		if (run.result === "running") notes.push("host execution has an unfinished outcome; inspect it before retrying");
+		if (run.output && sha256File(join(root, run.output.path)) !== run.output.sha256) notes.push(`host execution log changed or is missing (${run.output.path})`);
+	}
+	const div = detectDivergence(root, state.baseline, state.review?.pr ? PR_GIT_OPTIONS : []);
 	if (!div.noBaseline && div.summary !== "working tree matches baseline") {
 		notes.push(`git: ${div.summary}`);
 	}
@@ -608,14 +623,14 @@ function leaseConflict(root: string): string | null {
 	if (!lease || !isPidAlive(lease.pid)) return null;
 	const age = Date.now() - Date.parse(lease.refreshedAt ?? lease.createdAt);
 	const holder = holdsLock(root, LEASE_NAME)
-		? "this Pi session"
+		? "this Pi process (possibly another session/runtime)"
 		: `another process (pid ${lease.pid}, active ${Math.max(1, Math.round(age / 1000))}s ago)`;
 	return `task ${lease.taskId ?? "?"} of workflow ${lease.workflowId ?? "?"} is already being executed by ${holder} — wait for it to finish (check /rpac status)`;
 }
 
 function acquireActLease(root: string, workflowId: string, taskId: number | null = null): void {
 	if (holdsLock(root, LEASE_NAME)) {
-		throw new RpacGuardError(`cannot acquire ACT lease: ${leaseConflict(root) ?? "this Pi session already owns it"}`);
+		throw new RpacGuardError(`cannot acquire ACT lease: ${leaseConflict(root) ?? "this Pi process already owns it"}`);
 	}
 	acquireLock(root, LEASE_NAME, {
 		staleMs: 24 * 3600 * 1000,
@@ -675,6 +690,7 @@ function abandonActLease(root: string): void {
 const RpacAction = Type.Union([
 	Type.Literal("status"),
 	Type.Literal("review_scope"),
+	Type.Literal("review_check"),
 	Type.Literal("refine_complete"),
 	Type.Literal("plan_complete"),
 	Type.Literal("task_start"),
@@ -713,6 +729,15 @@ const RpacToolSchema = Type.Object({
 	),
 	/** plan_complete for reviews: exact project checks disclosed in the plan */
 	reviewChecks: Type.Optional(Type.Array(Type.String())),
+	/** plan_complete: reviewed host-execution recipe; never grants approval by itself */
+	reviewExecution: Type.Optional(Type.Object({
+		setupCommands: Type.Optional(Type.Array(Type.String())),
+		generatedPaths: Type.Optional(Type.Array(Type.String())),
+		screening: Type.Object({ summary: Type.String(), files: Type.Array(Type.String()), risks: Type.Array(Type.String()), recommendation: Type.Union([Type.Literal("run"), Type.Literal("do-not-run")]) }),
+	})),
+	/** review_check: exact registered command and whether it is setup or verification */
+	command: Type.Optional(Type.String()),
+	checkKind: Type.Optional(Type.Union([Type.Literal("setup"), Type.Literal("check")])),
 	/** review_scope: exact exclusions with recorded reasons */
 	exclusions: Type.Optional(Type.Array(Type.Object({ path: Type.String(), reason: Type.String() }))),
 	/** task_done/task_fail: verification checks that were run (task_done: mandatory, >= 1) */
@@ -748,6 +773,14 @@ function isPrReview(state: RpacState): boolean {
 
 export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGhRunner): void {
 	let completionRoot = rootOf(process.cwd());
+	// A process may host more than one Pi runtime. Filesystem ownership alone
+	// must not let a second runtime use or release this runtime's ACT lease.
+	let ownedExecution: { root: string; workflowId: string } | null = null;
+	const ownsExecution = (root: string, workflowId?: string): boolean => !!ownedExecution && ownedExecution.root === root && (!workflowId || ownedExecution.workflowId === workflowId) && holdsLock(root, LEASE_NAME) && readLockRecord(root, LEASE_NAME)?.workflowId === ownedExecution.workflowId;
+	const requireLocalExecution = (root: string, state: RpacState, action: string, task?: number | string) => {
+		if (!ownsExecution(root, state.id)) throw new RpacGuardError("This runtime does not own the ACT execution lease. The user must start or resume work here with /rpac act <id> or /rpac resume after the owning run stops.");
+		requireOwnedActLease(root, state, action, task);
+	};
 	const preferences = (root: string) => resolveStyle(stylePaths(getAgentDir(), root));
 	const progress = (root: string, phase: "refine" | "plan" | "act" | "consolidate") => progressMessage(phase, preferences(root).style.id);
 	const shownPreferenceNotes = new Set<string>();
@@ -757,6 +790,56 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			shownPreferenceNotes.add(note);
 		}
 	};
+	async function runReviewCheck(ctx: { cwd: string; ui: UiMin }, command: string, kind: "setup" | "check", signal?: AbortSignal) {
+		const root = rootOf(ctx.cwd), state = loadActive(root, root).state;
+		if (!state?.review?.pr || state.phase !== "act" || state.paused) throw new RpacGuardError("Run preview checks inside an active ACT review task. The user must start/resume it with /rpac act <id>.");
+		const task = state.tasks.find(entry => entry.status === "in_progress");
+		if (!task) throw new RpacGuardError("Start the review task before running checks.");
+		requireLocalExecution(root, state, "review_check", task.id);
+		assertHostApproval(root, state);
+		const execution = state.review.execution!;
+		if (execution.runs.some(run => run.result === "running")) throw new RpacGuardError("A prior host command has no recorded completion (for example after a process crash). Inspect and stop any remaining host processes before retrying; do not assume success. Preserve this workflow's evidence and ask the user to start a fresh /rpac preview, or record the blocker and finish with an explicitly incomplete report.");
+		if (!(kind === "setup" ? execution.setupCommands : state.review.approvedChecks).includes(command)) throw new RpacGuardError("Use an exact registered command and its setup/check kind; changing a command requires a revised plan and fresh approval.");
+		const issue = hostCommandIssue(state.review.pr.checkoutLocation, command, kind);
+		if (issue) throw new RpacGuardError(issue);
+		assertPrCheckout(root, state.review.pr, execution.generatedPaths);
+		const digest = execution.approval!.digest;
+		const already = execution.runs.find(run => run.kind === "setup" && run.command === command && run.approvalDigest === digest && run.result === "pass");
+		if (kind === "setup" && already) return textResult(`Setup already completed for this approved recipe. Preserve the existing evidence: ${already.output?.path ?? "workflow.json"}. Do not reinstall blindly.`, { action: "review_check", reused: true });
+		if (kind === "check" && execution.setupCommands.some(setup => !execution.runs.some(run => run.kind === "setup" && run.command === setup && run.approvalDigest === digest && run.result === "pass"))) throw new RpacGuardError("Complete the approved setup commands first, or record verification unavailable. Do not replace missing dependencies with an unapproved install.");
+		if (execution.runs.length >= 100) throw new RpacGuardError("This workflow already has 100 execution records. Preserve its evidence and start a new preview rather than discarding old results.");
+		const index = execution.runs.length, startedAt = nowIso();
+		updateActive(root, current => {
+			if (current.id !== state.id || executionDigest(current) !== digest) throw new RpacGuardError("Execution plan changed before dispatch.");
+			current.review!.execution!.runs.push({ command, kind, taskId: task.id, approvalDigest: digest, startedAt, result: "running" });
+		});
+		let stdout = "", stderr = "", code: number | undefined, result: "pass" | "fail" | "unavailable" = "unavailable", detail = "";
+		try {
+			const shellArgs = ["--noprofile", "--norc", "-c", command];
+			// Reduce incidental dependency downloads. These are hints, NOT network isolation.
+			const output = kind === "setup"
+				? await pi.exec("bash", shellArgs, { cwd: state.review.pr.checkoutLocation, signal, timeout: 600_000 })
+				: await pi.exec("env", ["npm_config_offline=true", "CARGO_NET_OFFLINE=true", "GOPROXY=off", "GOSUMDB=off", "PIP_NO_INDEX=1", "bash", ...shellArgs], { cwd: state.review.pr.checkoutLocation, signal, timeout: 600_000 });
+			stdout = output.stdout; stderr = output.stderr; code = output.code;
+			result = output.killed ? "unavailable" : code === 0 ? "pass" : "fail";
+			if (output.killed) detail = "Command was cancelled or timed out; completion is unverified.";
+		} catch (error) { detail = `Command could not complete: ${(error as Error).message}`; }
+		const path = join(workflowDir(root, state.id), `review-check-${index + 1}-${shortId()}.log`);
+		let changed = false;
+		try { assertPrCheckout(root, state.review.pr, execution.generatedPaths); assertScreeningCurrent(root, loadActive(root, root).state!); }
+		catch (error) { changed = true; detail += ` Evidence invalidated: ${(error as Error).message}`; }
+		atomicWriteFile(path, `Command: ${command}\nKind: ${kind}\nStarted: ${startedAt}\nFinished: ${nowIso()}\nExit code: ${code ?? "unavailable"}\nResult: ${result}\nLauncher: ${kind === "setup" ? "bash --noprofile --norc -c" : "env npm_config_offline=true CARGO_NET_OFFLINE=true GOPROXY=off GOSUMDB=off PIP_NO_INDEX=1 bash --noprofile --norc -c"}\nNetwork policy: ${kind === "setup" ? "setup network expected" : "offline dependency-manager hints set; host network is NOT sandboxed"}\n${detail}\n\nSTDOUT\n${stdout}\n\nSTDERR\n${stderr}\n`);
+		const outputArtifact = { path: relArtifactPath(root, path), sha256: sha256File(path) };
+		updateActive(root, current => {
+			if (current.id !== state.id) throw new RpacGuardError("Active workflow changed while a host command was running; inspect its saved log.");
+			current.review!.execution!.runs[index] = { command, kind, taskId: task.id, approvalDigest: digest, startedAt, result, ...(code === undefined ? {} : { exitCode: code }), output: outputArtifact, ...(detail ? { detail: detail.slice(0, 2000) } : {}) };
+			if (changed) recordReviewDrift(current, sha256Text(`${current.review!.fingerprint}\n${detail}`), [], [], current.review!.scopeItemIds);
+		});
+		appendLog(root, state.id, `- **${nowIso()}** host ${kind}: ${command}; ${result}; exit ${code ?? "unavailable"}; log ${outputArtifact.path}${changed ? "; source/provenance changed — coverage invalidated" : ""}`);
+		const verification = { name: command, kind: "observation" as const, result, detail: `exit ${code ?? "unavailable"}; log ${outputArtifact.path}${detail ? `; ${detail}` : ""}` };
+		return textResult(`${kind} result: ${result}; exit ${code ?? "unavailable"}. Full log: ${outputArtifact.path}${detail ? `\n${detail}` : ""}\nInclude this actual observation in task_done.verification (plus a separate acceptance check for review completeness):\n${JSON.stringify(verification)}`, { action: "review_check", verification, output: outputArtifact });
+	}
+
 	// Queue a phase directive as a follow-up user message; works whether or not
 	// the agent is currently streaming.
 	const issueDirective = (text: string): void => {
@@ -803,6 +886,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 
 	const SUBCOMMANDS = [
 		"start",
+		"preview",
 		"review",
 		"refine",
 		"plan",
@@ -822,13 +906,14 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 	] as const;
 
 	const SUB_HELP: Record<string, string> = {
+		"preview": "review a GitHub pull request: /rpac preview <number> [--yes]",
 		"start": "start a new workflow: /rpac start [--yes] <task> (--yes required headless to replace an active one)",
 		"review": "start a report-only review: /rpac review [current|staged|full] (default: current)",
 		"refine": "(re)issue the refine directive",
 		"plan": "approve requirements, then issue the plan directive",
 		"act": "execute the next approved task (flags: --sequential, task id)",
 		"consolidate": "issue the consolidate directive (--force for unfinished tasks / non-act phases)",
-		"approve": "approve: /rpac approve requirements|plan|sequential",
+		"approve": "approve: /rpac approve requirements|plan|sequential|execution (headless execution: --yes)",
 		"status": "show workflow progress (/rpac status --details for technical evidence)",
 		"style": "choose communication: /rpac style [name] [--global|--project|--reset-project]",
 		"list": "list saved workflows",
@@ -920,7 +1005,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		}
 	}
 
-	async function cmdStartPreview(ctx: ExtensionCommandContext, prNumberArg: string, yes: boolean): Promise<void> {
+	async function cmdStartPreview(ctx: ExtensionCommandContext, prNumberArg: string, yes: boolean, separateCheckout = false): Promise<void> {
 		const root = rootOf(ctx.cwd);
 		let controlLease = false;
 		try {
@@ -963,8 +1048,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				throw new RpacGuardError(`GitHub CLI is not authenticated (${auth.reason ?? "unknown reason"}) — run \`gh auth login\` and retry`);
 			}
 
-			// Repository identity + remote.
-			const info = gitInfo(root);
+			// Repository identity + remote; do not execute configured fsmonitor scripts.
+			const info = gitInfo(root, PR_GIT_OPTIONS);
 			if (!info.isRepo) throw new RpacGuardError("PR review requires a Git work tree — this directory is not a Git repository");
 			const assessment = assessPrCheckout(root);
 			if (!assessment.hasRemote || !assessment.remote) {
@@ -998,13 +1083,13 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			// Reassess AFTER confirmation and lease acquisition. Local work may have
 			// appeared while metadata or a dialog was pending.
 			const fresh = assessPrCheckout(root);
-			strategy = fresh.clean ? "in-place" : "worktree";
-			const freshInfo = gitInfo(root);
+			strategy = separateCheckout || !fresh.clean ? "worktree" : "in-place";
+			const freshInfo = gitInfo(root, PR_GIT_OPTIONS);
 			original = { branch: freshInfo.branch, head: freshInfo.head, dirty: freshInfo.dirty };
 
 			// Preflight objects and the full diff before changing any checkout.
 			if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
-				runGitText(root, ["fetch", remote, `refs/pull/${prNumber}/head`, `refs/heads/${resolved.baseRef}`]);
+				runPrGitText(root, ["fetch", remote, `refs/pull/${prNumber}/head`, `refs/heads/${resolved.baseRef}`]);
 				if (!verifyGitObjects(root, [resolved.baseSha, resolved.headSha])) {
 					throw new RpacGuardError(
 						`the PR base/head objects are not available locally (base ${resolved.baseSha.slice(0, 12)}, head ${resolved.headSha.slice(0, 12)}) — ` +
@@ -1033,7 +1118,9 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				pr: prMeta,
 				task: `PR review #${prNumber}`,
 			});
-			state.baseline = captureBaseline(root);
+			state.baseline = captureBaseline(root, PR_GIT_OPTIONS);
+			state.version = RPAC_PREVIEW_STATE_VERSION;
+			state.review!.execution = { version: 1, setupCommands: [], generatedPaths: [], runs: [] };
 			mkdirSync(workflowDir(root, state.id), { recursive: true });
 			atomicWriteFile(reviewManifestFile(root, state.id), manifestText);
 			createWorkflow(root, state, true);
@@ -1261,6 +1348,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			// Acquire before any ACT state transition or approval dialog. Lifecycle
 			// commands cannot switch the active workflow while this command waits.
 			acquireActLease(root, state.id);
+			ownedExecution = { root, workflowId: state.id };
 			leaseAcquired = true;
 			if (state.workflowKind === "review") {
 				const driftMessage = recheckReviewSnapshot(root, state, gh);
@@ -1337,7 +1425,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			refreshUI(ctx.ui, root);
 			ctx.ui.notify(`${progress(root, "act")}\n${result.message}`, "info");
 		} catch (err) {
-			if (leaseAcquired && !directiveIssued) abandonActLease(root);
+			if (leaseAcquired && !directiveIssued) { abandonActLease(root); ownedExecution = null; }
 			fail(ctx.ui, err, "act failed");
 		}
 	}
@@ -1411,7 +1499,9 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 	}
 
 	async function cmdApprove(ctx: ExtensionCommandContext, args: string): Promise<void> {
-		const what = args.trim().toLowerCase();
+		const tokens = args.trim().split(/\s+/).filter(Boolean);
+		const what = (tokens.shift() ?? "").toLowerCase();
+		if ((what !== "execution" && tokens.length) || tokens.some(token => token !== "--yes") || tokens.length > 1) { fail(ctx.ui, new Error("Use /rpac approve requirements|plan|sequential, or /rpac approve execution [--yes]."), "invalid approval"); return; }
 		const root = rootOf(ctx.cwd);
 		let controlLease = false;
 		try {
@@ -1419,6 +1509,27 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			controlLease = true;
 			let message: string;
 			switch (what) {
+				case "execution": {
+					const state = loadActive(root, root).state;
+					if (!state?.review?.pr || !["plan", "act"].includes(state.phase)) throw new RpacGuardError("Host execution approval requires an active PR preview with a finalized plan and screening.");
+					assertScreeningCurrent(root, state);
+					assertPrCheckout(root, state.review.pr, state.review.execution!.generatedPaths);
+					const digest = executionDigest(state), explanation = hostApprovalText(state);
+					const approved = ctx.hasUI ? await ctx.ui.confirm("Allow these screened PR commands on this host?", explanation) : tokens.includes("--yes");
+					if (!approved) throw new RpacGuardError(`${explanation}\n\nHost execution not approved. Read the screening and risks first. Headless approval: /rpac approve execution --yes. Source-only review may continue.`);
+					const current = loadActive(root, root).state;
+					if (!current || current.id !== state.id || executionDigest(current) !== digest) throw new RpacGuardError("Screening changed while approval was pending. Review it again.");
+					assertScreeningCurrent(root, current);
+					assertPrCheckout(root, current.review!.pr!, current.review!.execution!.generatedPaths);
+					const at = nowIso(), recordPath = join(workflowDir(root, state.id), `host-approval-${shortId()}.json`);
+					if (existsSync(recordPath)) throw new RpacGuardError("Approval evidence path already exists; preserving it. Retry approval to allocate a new record.");
+					atomicWriteFile(recordPath, JSON.stringify({ version: 1, at, digest, workflow: state.id, plan: current.artifacts.plan, scopeFingerprint: current.review!.fingerprint, pr: current.review!.pr, execution: { ...current.review!.execution, approval: undefined, runs: undefined }, checks: current.review!.approvedChecks, network: "Setup network expected; checks expected offline. Host network is not sandboxed." }, null, 2) + "\n");
+					const record = { path: relArtifactPath(root, recordPath), sha256: sha256File(recordPath) };
+					updateActive(root, s => { if (s.id !== state.id || executionDigest(s) !== digest) throw new RpacGuardError("Execution recipe changed during approval."); s.review!.execution!.approval = { at, digest, record }; recordEvent(s, "host_execution_approved", `user approved screened host recipe; no sandbox; record ${record.path} (${record.sha256})`); });
+					appendLog(root, state.id, `- **${at}** host approval evidence: ${record.path} (${record.sha256}); digest ${digest}`);
+					message = "Host execution approved for the exact screened recipe. Use rpac review_check inside an ACT task; changed commands or inputs require fresh approval. This is not a sandbox.";
+					break;
+				}
 				case "requirements": {
 					const { state } = loadActive(root, root);
 					if (!state) throw new RpacStateError("not_found", "no active workflow");
@@ -1547,6 +1658,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					if (inProgress || interrupted || cur.approvals.plan) {
 						const requested = inProgress ?? interrupted;
 						acquireActLease(root, cur.id);
+						ownedExecution = { root, workflowId: cur.id };
 						leaseAcquired = true;
 						if (cur.workflowKind === "review") {
 							const driftMessage = recheckReviewSnapshot(root, cur, gh);
@@ -1629,7 +1741,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			refreshUI(ctx.ui, root);
 			ctx.ui.notify(`RPAC resumed workflow ${cur.id}: ${cur.task}\n${statusOpening(cur, preferences(root).style.id)}`, "info");
 		} catch (err) {
-			if (leaseAcquired && !directiveIssued) abandonActLease(root);
+			if (leaseAcquired && !directiveIssued) { abandonActLease(root); ownedExecution = null; }
 			fail(ctx.ui, err, "resume failed");
 		}
 	}
@@ -1797,7 +1909,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			} else {
 				const ok = await ctx.ui.confirm(
 					"RPAC: remove the isolated PR worktree?",
-					`This removes ${prWorktreePath(root, pr.number)}. Your main worktree and its changes are NOT touched.`,
+					`This removes ${pr.checkoutLocation}. Your main worktree and its changes are NOT touched.`,
 				);
 				if (!ok) {
 					ctx.ui.notify("Cancelled.", "info");
@@ -1807,8 +1919,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			acquireActLease(root, "control:pr-cleanup");
 			controlLease = true;
 			if (loadActive(root, root).state?.id !== state.id) throw new RpacGuardError("active workflow changed while cleanup confirmation was pending");
-			if (pr.checkoutLocation !== prWorktreePath(root, pr.number)) throw new RpacGuardError("recorded PR worktree location does not match; refusing cleanup");
-			const result = removePrWorktree(root, pr.number, pr.headSha);
+			if (!isPrWorktreeLocation(root, pr.number, pr.checkoutLocation)) throw new RpacGuardError("recorded PR worktree location does not match; refusing cleanup");
+			const result = removePrWorktree(root, pr.number, pr.headSha, pr.checkoutLocation);
 			releaseLock(root, LEASE_NAME);
 			controlLease = false;
 			appendLog(root, state.id, `- **${nowIso()}** pr-cleanup: ${result}`);
@@ -1918,7 +2030,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 
 	pi.registerCommand("rpac", {
 		description:
-			"RPAC workflow: /rpac [start <task>|start preview <pr-number>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|style|list|resume|accept|pause|abort|pr-cleanup|handoff|cleanup]",
+			"RPAC workflow: /rpac [start <task>|preview <pr-number>|start preview <pr-number>|review [current|staged|full]|refine|plan|act|consolidate|approve|status|style|list|resume|accept|pause|abort|pr-cleanup|handoff|cleanup]",
 		getArgumentCompletions: (prefix) => {
 			const styles = styleCompletions(prefix, preferences(completionRoot).styles);
 			if (styles) return styles.length ? styles : null;
@@ -1949,6 +2061,12 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 							? `Saved ${command.id} as ${command.scope === "global" ? "your personal default" : "this project's override"}.${command.scope === "global" && result.source === "project override" ? " This project still has an override; use /rpac style --reset-project to inherit the personal default." : ""}\n`
 							: command.action === "reset" ? "Project override removed.\n" : "";
 						ctx.ui.notify(saved + styleReport(result), "info");
+						break;
+					}
+					case "preview": {
+						const { flags, rest: number } = parseFlags(tokens);
+						if ([...flags].some(flag => flag !== "yes") || number.includes(" ")) throw new Error("Use /rpac preview <positive PR number> [--yes].");
+						await cmdStartPreview(ctx, number, flags.has("yes"), true);
 						break;
 					}
 					case "start":
@@ -2042,7 +2160,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		description:
 			"RPAC workflow state machine (Refine → Plan → Act → Consolidate). Actions: " +
 			"status (read state), review_scope (review workflows: recapture manifest with exact exclusions), refine_complete (requirements artifact done — user must approve), " +
-			"plan_complete (plan + task list done — user must approve), " +
+			"plan_complete (plan + task list done — user must approve; PR code execution also needs reviewExecution screening and separate host approval), " +
+			"review_check (run an exact screened, user-approved host setup/check command and persist its real exit status/log; command + checkKind setup|check), " +
 			"task_start/task_done/task_fail/task_block/task_unblock (the task named by /rpac act is already started; use task_start only to advance sequential mode; task_done REQUIRES verification " +
 			"checks and only passes when all acceptance checks pass; observation checks can record audited failures without failing the task; pass deliverables to hash task-produced files), " +
 			"decision/deviation/checkpoint (record to the workflow log), consolidate_complete (report.md done), " +
@@ -2051,8 +2170,9 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		promptGuidelines: [
 			"Only call `rpac` actions while an RPAC workflow is active (started via /rpac start or /rpac review).",
 			"Never approve anything yourself: approvals happen via user dialogs or /rpac approve.",
-			"Review workflows are report-only: write only their named workflow artifacts; findings become separate ordinary RPAC work, never source edits in the review.",
-			"The task named in an ACT directive is already in_progress. Do not call task_start for it; in sequential mode, call task_start only after task_done succeeds.",
+			"Review source and Git stay read-only. Only rpac review_check may execute registered PR scripts or install dependencies, after script screening and separate user host approval. It may produce disclosed untracked build/test outputs. This is not a sandbox. Never use a shell wrapper to bypass the gate.",
+			"Call rpac directly, never tools.rpac in codemode. The named ACT task is already started. In sequential mode call task_start with task next immediately AFTER successful task_done and BEFORE reading/writing the next batch. After interruption, stop until the user runs /rpac act <id> or /rpac resume.",
+			"Never record deferred or not-run tests as pass. Use unavailable and explain the missing evidence. Screening and saved commands do not prove runtime behavior.",
 			"task_done requires real verification — run checks and report actual outcomes. Acceptance failures fail the task; for audit/review work, use kind=observation for a subject failure and a separate passing acceptance check that the result was correctly captured. Include every task-produced file in deliverables so RPAC can hash and track it.",
 		],
 		exposure: "model-only",
@@ -2076,13 +2196,15 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					);
 				}
 
+				if (params.action === "review_check") return await runReviewCheck(ctx, params.command ?? "", params.checkKind ?? "check", _signal);
+
 				if (TASK_ACTIONS.has(params.action) && params.task === undefined) {
 					throw new RpacGuardError(`${params.action} requires a "task" argument (task id number, or "next")`);
 				}
 				if (ACT_LEASE_ACTIONS.has(params.action)) {
 					const active = loadActive(root, root).state;
 					if (!active) throw new RpacStateError("not_found", "no active RPAC workflow");
-					if (active.phase === "act") requireOwnedActLease(root, active, params.action, params.task);
+					if (active.phase === "act") requireLocalExecution(root, active, params.action, params.task);
 				}
 
 				// --- mutations (all under the state lock) ---
@@ -2113,17 +2235,28 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					}
 					case "plan_complete": {
 						const active = loadActive(root, root).state;
-						if (active && isPrReview(active) && (params.reviewChecks ?? []).some(check => !hasPrCheckDirectory(active, check))) {
-							throw new RpacGuardError(`PR review checks must include the checkout directory in the exact approved command: ${prCheckPrefix(active.review!.pr!.checkoutLocation)}`);
+						if (active && isPrReview(active)) for (const check of params.reviewChecks ?? []) {
+							const issue = hostCommandIssue(active.review!.pr!.checkoutLocation, check, "check");
+							if (issue) throw new RpacGuardError(`PR review checks require the exact checkout directory prefix and supported launchers: ${issue}`);
 						}
-						const res = run((s) => planComplete(
+						if (active?.review) validateReviewAssignments(readFileSync(artifactFile(root, active.id, "plan"), "utf8"), params.tasks ?? []);
+						const hostExecution = active?.review?.pr && params.reviewExecution ? prepareHostExecution(active, params.reviewChecks ?? [], params.reviewExecution) : undefined;
+						if (active?.review?.pr) for (const check of params.reviewChecks ?? []) {
+							if (hostExecution) { const issue = hostCommandIssue(active.review.pr.checkoutLocation, check, "check"); if (issue) throw new RpacGuardError(issue); }
+							else if (!isReadOnlyCommand(check)) throw new RpacGuardError("This plan requests execution of PR code without script screening. Supply reviewExecution (summary, files, risks, recommendation), or mark runtime checks unavailable. Installs go in setupCommands; plan approval alone never authorizes host execution.");
+						}
+						const res = run((s) => {
+							const result = planComplete(
 							s,
 							artifactFile(root, s.id, "plan"),
 							params.tasks ?? [],
 							relWorkflowArtifactPath(root, s.id, "plan"),
 							params.reviewChecks ?? [],
-						));
-						message = res.message;
+							);
+							if (s.review?.pr) { s.version = RPAC_PREVIEW_STATE_VERSION; s.review.execution = hostExecution ?? { version: 1, setupCommands: [], generatedPaths: [], runs: s.review.execution?.runs ?? [] }; }
+							return result;
+						});
+						message = res.message + (hostExecution ? " Host execution requires separate user approval: /rpac approve execution. Screening is not proof of safety." : "");
 						needsApproval = res.needsApproval;
 						logLine = `- **${nowIso()}** plan finalized with ${res.state.tasks.length} tasks: ${res.state.tasks.map((t) => `${t.id}.${t.title}`).join("; ")}`;
 						break;
@@ -2160,7 +2293,13 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 							if (supplied.some((path) => path !== expected)) {
 								throw new RpacGuardError("review task deliverables are report-only; only the current batch evidence artifact is allowed");
 							}
+							for (const outcome of before.review?.execution?.runs.filter(entry => entry.taskId === targetId) ?? []) {
+								if (outcome.result === "running" || !outcome.output) throw new RpacGuardError("A host command has no completed outcome. Inspect the interrupted run; do not claim verification passed.");
+								if (sha256File(join(root, outcome.output.path)) !== outcome.output.sha256) throw new RpacGuardError(`Host execution log changed or is missing: ${outcome.output.path}. Preserve and inspect the evidence; do not claim it was verified.`);
+								if (!params.verification?.some(check => check.name === outcome.command && check.result === outcome.result && check.detail?.includes(outcome.output!.path))) throw new RpacGuardError(`Include the actual ${outcome.result} host observation and its log ${outcome.output.path} in verification. Do not drop failed or unavailable checks.`);
+							}
 						}
+						if (before.review?.execution && before.tasks.every(entry => entry.id === targetId || entry.status === "done")) requireRuntimeEvidence(before, params.verification ?? []);
 						const deliverables = captureDeliverables(root, params.deliverables);
 						message = run((s) => taskDone(s, params.task as number | string, params.verification ?? [], params.deviations, deliverables)).message;
 						logLine = `- **${nowIso()}** ${message}`;
@@ -2258,7 +2397,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					for (const line of logLine.split("\n")) appendLog(root, curId, line);
 				}
 				// Activity refresh while executing a task.
-				if (holdsLock(root, LEASE_NAME)) refreshLock(root, LEASE_NAME);
+				if (ownsExecution(root)) refreshLock(root, LEASE_NAME);
 				refreshUI(ui, root);
 				return textResult(message, { action: params.action });
 			} catch (err) {
@@ -2292,7 +2431,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		// Release the ACT lease: this process will execute no more tasks.
 		try {
 			const root = rootOf(ctx.cwd);
-			if (holdsLock(root, LEASE_NAME)) releaseLock(root, LEASE_NAME);
+			if (ownsExecution(root)) releaseLock(root, LEASE_NAME);
+			if (ownedExecution?.root === root) ownedExecution = null;
 		} catch {
 			// best effort
 		}
@@ -2317,15 +2457,16 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 				return;
 			}
 			if (state.workflowKind === "review" || state.phase === "refine" || state.phase === "plan") {
+				if (state.workflowKind === "review" && state.phase === "act" && ["write", "edit"].includes(event.toolName) && !ownsExecution(root, state.id)) return { block: true, reason: "This session does not own review execution. Do not write another session\'s ledger. After the owning run stops, the user can restart with /rpac act <id> or /rpac resume." };
 				const decision = gateToolCall(state, ctx.cwd, event.toolName, event.input as Record<string, unknown> | undefined, root);
 				if (decision) return { block: true, reason: humanError(decision.reason) };
 				if (isPrReview(state) && typeof (event.input as Record<string, unknown>)?.command === "string" &&
 					isApprovedReviewCheck(state, (event.input as { command: string }).command)) {
-					assertPrCheckout(root, state.review!.pr!);
+					assertPrCheckout(root, state.review!.pr!, state.review!.execution?.generatedPaths ?? []);
 				}
 			}
 			// Activity refresh: the model is making progress on an ACT task.
-			if (state.phase === "act" && holdsLock(root, LEASE_NAME)) refreshLock(root, LEASE_NAME);
+			if (state.phase === "act" && ownsExecution(root, state.id)) refreshLock(root, LEASE_NAME);
 		} catch (err) {
 			// Failure to establish review/check provenance must not allow execution.
 			return { block: true, reason: `RPAC cannot safely authorize this tool call: ${(err as Error).message}` };
@@ -2336,35 +2477,25 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 	// not appended to the session. Re-resolve after compaction, reload and handoff.
 	// Never replace Pi's system prompt or tool declarations.
 	pi.on("context", (event, ctx) => {
-		const messages = event.messages.filter((message) => !(message.role === "custom" && message.customType === "rpac-style"));
+		const messages = event.messages.filter((message) => !(message.role === "custom" && ["rpac-style", "rpac-context"].includes(message.customType)));
 		try {
 			const root = rootOf(ctx.cwd);
 			const state = peekActive(root, root);
 			if (state && !state.paused && state.phase !== "done" && state.phase !== "aborted") {
 				const preference = preferences(root);
 				notePreferences(ctx.ui, preference.notes);
-				messages.push({ role: "custom", customType: "rpac-style", content: styleInstruction(preference.style), display: false, timestamp: Date.now() });
+				const content = `[Installed RPAC runtime guidance — not PR source content]\nApply silently; do not acknowledge or narrate reminders. This is current saved state, not a request to continue work: respect the user's actual request or interruption. Older phase directives describe the start of the run; do not repeat completed tasks because an old task number remains below.\n${phaseContext(state, root, ownsExecution(root, state.id), readLockRecord(root, LEASE_NAME)?.taskId)}\nInspection tools: read, grep, find, ls, todo and codemode. Use literal read-only shell commands; safe rg searches and sed -n numeric-range reads are supported. Call rpac directly, not tools.rpac in codemode.\n${styleInstruction(preference.style)}`;
+				// Keep guidance before the initiating user turn, never after tool results as a fresh request.
+				let userIndex = messages.length - 1;
+				while (userIndex >= 0 && messages[userIndex]?.role !== "user") userIndex--;
+				messages.splice(Math.max(0, userIndex), 0, { role: "custom", customType: "rpac-style", content, display: false, timestamp: Date.now() });
 			}
 		} catch { /* no presentation on unreadable state; existing gates still fail closed */ }
 		return { messages };
 	});
 
-	// ---- tiny per-turn phase context (MTP2-style) ------------------------------
-
-	pi.on("before_agent_start", async (_event, ctx) => {
-		try {
-			const root = rootOf(ctx.cwd);
-			const state = peekActive(root, root);
-			if (!state) return;
-			const text = phaseContext(state, root);
-			if (!text) return;
-			return {
-				message: { customType: "rpac-context", content: text, display: false },
-			};
-		} catch {
-			return;
-		}
-	});
+	// Phase/task pointers now share the request-local context above. No persisted,
+	// increasingly stale before_agent_start message during sequential execution.
 
 	// ---- end of model execution cycle ------------------------------------------
 
@@ -2373,7 +2504,7 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 		// Record interruption while the lease still excludes workflow switching;
 		// only then release it for the next execution cycle.
 		try {
-			const lease = holdsLock(root, LEASE_NAME) ? readLockRecord(root, LEASE_NAME) : null;
+			const lease = ownsExecution(root) ? readLockRecord(root, LEASE_NAME) : null;
 			const { state } = loadActive(root, root);
 			if (
 				lease && state && lease.workflowId === state.id && state.phase === "act" && !state.paused &&
@@ -2386,7 +2517,8 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 			// best effort — status will surface whatever happened
 		} finally {
 			try {
-				if (holdsLock(root, LEASE_NAME)) releaseLock(root, LEASE_NAME);
+				if (ownsExecution(root)) releaseLock(root, LEASE_NAME);
+				if (ownedExecution?.root === root) ownedExecution = null;
 			} catch {
 				// best effort
 			}

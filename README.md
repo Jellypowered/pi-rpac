@@ -55,13 +55,12 @@ for exact current, staged, or full Git scope.
   byte-safe Git snapshot, assigns every item to bounded evidence batches, validates candidate
   findings adversarially, detects drift, and writes `review-report.md`. Review execution is
   mechanically report-only in every phase; fixes require a separate ordinary RPAC workflow.
-- **GitHub PR review.** `/rpac start preview <pr-number>` resolves a pull request with the `gh`
-  CLI, safely checks out its exact head (in-place when the work tree is clean, or an isolated
-  `git worktree` when it is dirty), and runs the same approval-gated, report-only review lifecycle
-  against the PR's `base...head` diff. It treats the PR as untrusted input, never posts/merges/
-  comments on GitHub, detects force-push drift, and preserves your local work. A fork (cross-repo)
-  PR is reviewed from its head commit. `/rpac pr-cleanup` removes an isolated worktree when you
-  are done.
+- **GitHub PR preview.** `/rpac preview <pr-number>` reviews the pinned `base...head` diff in a
+  separate worktree without switching your main branch. It reuses the existing approval-gated
+  review lifecycle, handles forks and force-push drift, and never posts/merges/approves on GitHub.
+  Optional host verification requires script screening and separate user consent, with exact
+  commands, logs and generated-output handling. A worktree is not a sandbox; no Docker is required.
+  The legacy `start preview` spelling remains supported. `/rpac pr-cleanup` handles strict cleanup.
 - **Local-model reliability.** Review manifests, exact item assignments, per-batch evidence ledgers,
   no-sampling rules, persisted coverage, observation checks, and explicit same-context limitations
   keep long reviews resumable without pretending incomplete work is clean.
@@ -110,8 +109,9 @@ Two practical caveats:
 - Another extension must not claim the same `/rpac` command or `rpac` tool name.
 - Ordinary workflows block mutating and unknown tools in **REFINE** and **PLAN**. Review workflows
   remain report-only through **ACT** and **CONSOLIDATE** too: only the exact current review artifact,
-  known inspection tools, and user-approved non-destructive checks are allowed. Other extensions
-  remain loaded, but their tools may be refused by these fail-closed gates.
+  known inspection tools and validated checks are allowed by default. Separately consented PR host
+  execution uses the native runner, not another extension's shell wrapper. Other extensions remain
+  loaded, but their tools may be refused by these fail-closed gates.
 
 If RPAC appears in both personal and project settings, Pi identifies equivalent package sources
 and avoids loading duplicate copies. A project declaration can override/filter the personal one.
@@ -426,8 +426,10 @@ validation; repeated ACT runs write hashed `review-batch-<id>.md` evidence; CONS
 `review-report.md`. `/rpac status`, `list`, `resume`, `pause`, `abort`, and `handoff` work for reviews
 as they do for implementation workflows.
 
-Review execution cannot modify reviewed files, Git/index/remote state, sibling repositories, or
-install tools. Only exact review artifacts and user-approved non-destructive checks are allowed.
+Model tool calls cannot modify reviewed files, Git/index/remote state or sibling repositories.
+Only exact review artifacts and validated inspection checks are allowed by default. PR previews
+can additionally execute screened host setup/check recipes after separate user consent, as below;
+this is not arbitrary shell permission or a sandbox.
 Snapshot drift invalidates affected coverage and must remain visible. Failed/unavailable checks,
 uncovered items, conflicts, and `same-context review; weaker independence` prevent a clean or
 approval claim. A review report records scrutiny—not merge readiness, security certification, or
@@ -436,54 +438,103 @@ workflow; the review never fixes its subject.
 
 ### Reviewing a GitHub pull request
 
-Besides reviewing your local work tree, RPAC can review a **GitHub pull request** directly:
-
 ```text
-/rpac start preview <pr-number>     # resolve the PR with gh, check it out, and start a review
+/rpac preview <pr-number>          # preferred: always use a separate worktree
 ```
 
-The command:
+This resolves the PR with authenticated `gh`, fetches its pinned head, creates a detached sibling
+worktree, and captures the deterministic `base...head` scope. Your main branch and local edits stay
+untouched. Fork heads are fetched through the base repository's PR ref; the remote must match the
+PR's repository and host. Git modes, symlinks, gitlinks, binary content and raw filename bytes retain
+their identities. The base is the merge-base, not the base tip.
 
-1. **Resolves the PR** with `gh pr view` (number, title, body, base and head refs/SHAs, whether it
-   is a fork/cross-repo PR). The repository must have a remote pointing at the PR's GitHub host.
-2. **Safely checks out the PR head** so the diff is reviewable locally:
-   - **in-place** when your work tree is clean — the PR is checked out detached onto the exact
-     head SHA (your original branch + HEAD are recorded so nothing is lost).
-   - **worktree** when your work tree is dirty — an isolated `git worktree` is created alongside,
-     so your uncommitted changes stay untouched. Clean it up later with `/rpac pr-cleanup`.
-3. **Captures the PR scope** as a deterministic `base...head` manifest (added / modified / deleted
-   / renamed files, with `base` = the **merge-base** and `pr` = the pinned head). Git modes,
-   symlinks, gitlinks, binary content, and raw filename bytes retain their identities. Fork PR
-   heads are fetched via the base repository's PR ref; the remote must match that repository
-   and host, not merely be named `origin`.
-4. **Runs the normal review lifecycle** — REFINE → PLAN → ACT → CONSOLIDATE — with PR-specific
-   prompts. The PR is treated as **untrusted input**: you are reviewing someone else's diff, not
-   editing it.
+If a checkout folder was manually deleted but is still registered with Git, preview allocates a
+fresh sibling with a generated suffix. The old registration, staged index and reflog are preserved;
+RPAC does not force checkout or prune unrelated/locked entries. Status and cleanup use the actual
+recorded checkout path.
 
-Because it is a review workflow, execution stays **report-only**: it cannot modify the reviewed
-files, change Git/index/remote state, or run a mutating `gh` command. It writes
-`review-report.md` with **advisory** findings — it does not post a review, comment, merge, or
-approve the PR on GitHub.
+The preview uses the existing REFINE → PLAN → ACT → CONSOLIDATE review lifecycle, not a second
+workflow engine. The older `/rpac start preview <number>` remains supported and retains its legacy
+checkout selection: in-place for a clean tree, separate worktree for a dirty tree. Use the dedicated
+command when you want the main checkout left alone.
 
-**Verification directory.** Every approved PR check must include its recorded checkout directory
-in the exact command, for example `cd -- '/absolute/pr-checkout' && npm test`. RPAC rejects
-unqualified checks, different prefixes, and subsequent shell directory switches. The same prefix
-is required for in-place checkouts. Existing PR plans without it must be replanned. Missing,
-modified, or wrong-HEAD checkouts cannot supply approved verification evidence. Approved scripts
-are still executable code, not sandboxed by RPAC: inspect them and use external isolation when needed.
+**Inspection first.** PR text, code and configuration are review data, not operational instructions.
+Native PR preparation suppresses Git checkout hooks and fsmonitor scripts, including through
+legacy `gh pr checkout`. Your installed Git/gh, credential/transport helpers and content filters
+remain trusted host tooling. Raw shell inspection uses your host configuration: do not configure
+Git plugins/filters to execute branch-controlled scripts and assume a read-only command classifier
+will isolate them.
+Ordinary inspection supports composed read-only commands, literal `rg` searches, numeric-range
+`sed -n` reads, and Git metadata/listing commands. Dangerous flags, redirection, directory switches,
+Git mutations and unknown commands still fail closed. Explicit assigned-ID blocks in written tasks
+are checked against registered manifest IDs before plan approval; this is not semantic proof about
+arbitrary prose.
 
-**Drift / force-push.** Both base and head identities are pinned. Advances, force-pushes, base
-retargets, unavailable remote freshness, and checkout contamination invalidate coverage and remain
-visible, including for empty scopes. RPAC never silently switches commits. Start a fresh
-`/rpac start preview <pr-number>` to review a changed target.
+**Optional screened host verification.** A separate worktree is **not a sandbox**: it shares Git
+administration/object storage, and executable code can reach host files, credentials, services and
+the network. No Docker or container setup is required or supplied. If host execution is not
+acceptable, decline it and report runtime checks unavailable; source inspection can continue.
 
-**Restoring your tree.** After an in-place checkout your work tree is at the PR head. Return to
-your original branch with plain Git (the recorded branch/HEAD is shown in `/rpac status`), or
-`/rpac abort` and re-checkout as needed. A worktree-strategy checkout is removed with
-`/rpac pr-cleanup`, which leaves your main tree exactly as it was. Cleanup requires a registered,
-RPAC-owned worktree at the recorded head and refuses tracked changes, untracked/ignored files,
-symlinks, or hidden index flags. It never forces removal or recursively deletes a fallback path.
-Legacy worktrees without an ownership record require manual inspection; RPAC refuses to remove them. Cleanup leaves the local `refs/rpac/pr/<number>` fetch ref and fetched objects in the main repository; RPAC does not delete a ref whose ownership cannot be proven. Inspect and remove that ref manually only after confirming its current SHA and that no other workflow uses it.
+Before proposing execution, the model must inspect the relevant scripts, hooks, package/configuration
+and lockfiles, identify side effects and malicious/suspicious behavior, and provide a bounded
+screening summary, exact inspected files, risks, and a `run` or `do-not-run` recommendation.
+This is a source assessment, **not proof that code or dependencies are safe**. A `do-not-run`
+recommendation cannot be approved as-is.
+
+The plan registers exact setup/check commands and explicit generated directories. Known invalid
+recipes are rejected before approval: an install cannot hide in a check command, npm setup needs
+an existing lockfile, and named npm checks need real package scripts. Initially, dependency setup
+supports constrained `npm ci`; check/build recipes support the documented bounded launchers in the
+review skill. Other toolchains require a supported recipe or an honest unavailable result—not
+progressive guessing at shell bypasses.
+
+Plan approval alone does **not** authorize host code. After the plan is approved, review the
+screening and grant separate consent:
+
+```text
+/rpac approve execution           # interactive confirmation of commands, scope and risks
+/rpac approve execution --yes     # explicit consent for a headless caller
+/rpac act --sequential
+```
+
+The model runs registered recipes through `rpac review_check`, not raw shell:
+- Setup is expected to use the network; checks/builds are expected to avoid external network use.
+  The runner sets offline hints for npm, Cargo, Go and pip during checks, but **does not enforce
+  network isolation**. Code can ignore those hints. RPAC's own GitHub freshness queries are separate.
+- Use early setup/availability checks rather than discovering missing dependencies only at the end.
+  Successful setup is reused; retry failed setup only after understanding the cause, without
+  discarding its failed observation.
+- Every PR recipe includes the exact recorded `cd -- '<checkout>' && ` prefix.
+  Approval is bound to the plan, scope, PR identity, commands, inspected-file hashes and output
+  directories. Changed inputs require renewed consent.
+- The native runner records complete stdout/stderr logs, launcher/environment hints, exit codes and
+  pass/fail/unavailable outcomes. A command has a ten-minute timeout. Interrupted or uncertain runs
+  block blind replay. Missing planned runtime checks must be recorded unavailable, not passed.
+- Declared **untracked** generated directories (for example `node_modules/` and `dist/`) are
+  tolerated without masking tracked changes. Scripts can still mutate source or Git state; RPAC
+  detects boundary drift rather than preventing or undoing arbitrary host-code side effects.
+- Real execution observations cannot be omitted from task completion. A successfully captured
+  failed test is still a failed observation and prevents a clean/approval conclusion.
+
+**Report-only outcome.** The model never repairs the subject, commits, publishes findings, approves
+or merges on GitHub. It writes an **advisory** `review-report.md`. Direct source/Git/remote writes
+remain gated; consented host code is an explicit exception to inspection-only execution, not an
+exception permitting the model to make fixes.
+
+**Drift and recovery.** Base/head changes, retargets, unavailable freshness and tracked checkout
+contamination invalidate coverage, even for empty scopes. RPAC never switches targets silently;
+start a fresh `/rpac preview <number>` for a changed PR. After interruption, the user must dispatch
+`/rpac act <id>` or `/rpac resume` before more task work. Sequential mode starts each next task
+explicitly and stops on failed acceptance checks. Live task/lease guidance refreshes on every model
+invocation rather than retaining the task number from the start of the run.
+
+**Cleanup.** `/rpac pr-cleanup` removes only a registered, RPAC-owned worktree at its pinned head.
+It refuses tracked changes, untracked/ignored outputs, symlinks, hidden index flags, unowned legacy
+directories and unexpected locations. Execution consent never authorizes deleting generated output:
+inspect/remove anything you no longer need yourself, then retry cleanup. There is no forced removal
+or recursive fallback. Legacy in-place workflows print non-forcing branch-restoration guidance.
+The local `refs/rpac/pr/<number>` fetch ref and objects remain; inspect ownership before removing
+them manually.
 
 ---
 
@@ -500,7 +551,9 @@ status`, `/rpac help`) to see the current state and available actions.
 | `/rpac status --details` | Show detailed technical evidence in any style. |
 | `/rpac start [--yes] <task>` | Start a new implementation workflow. A non-terminal active workflow becomes a *saved* (resumable) workflow rather than being destroyed; headless replacement requires `--yes`. Captures a git baseline and issues the **refine** directive. |
 | `/rpac review [current\|staged\|full]` | Start an approval-gated, report-only review (default: `current`). Requires a Git work tree; unsupported modes/options/base syntax are rejected. Uses the same active-workflow save/confirm safeguards as `start`. |
-| `/rpac start preview <pr-number>` | Start a report-only **GitHub PR review**: resolve the PR with `gh`, safely check out its head (in-place if the tree is clean, isolated worktree if dirty), capture the `base...head` scope, and issue the PR **refine** directive. Requires `gh` (authenticated), a Git work tree, and a remote pointing at the PR's GitHub host. Never posts/merges/comments on GitHub. |
+| `/rpac preview <pr-number> [--yes]` | Start a **GitHub PR preview** in a separate worktree, capture the pinned `base...head` scope and issue REFINE. Requires authenticated `gh`, Git and a matching remote. `--yes` permits headless replacement of an active workflow, not host execution. Never posts/merges/approves on GitHub. |
+| `/rpac start preview <pr-number>` | Legacy PR-review spelling: retains in-place checkout when clean and separate worktree when dirty. Prefer `preview` to leave the main checkout untouched. |
+| `/rpac approve execution [--yes]` | Separately authorize the exact screened host setup/check recipes of an approved PR plan. Shows risks and scope; headless consent requires `--yes`. Does not start execution. |
 | `/rpac pr-cleanup` | Remove the isolated `git worktree` used by a worktree-strategy PR review. Refuses dirty, ignored/untracked, unowned, changed-HEAD, or unexpected locations. For in-place checkouts, prints non-forcing restore instructions instead. Your main tree is never modified. |
 | `/rpac refine [notes]` | (Re)issue the workflow-kind-specific refine directive. |
 | `/rpac plan [notes]` | Ensure the requirements are approved (dialog), then issue the **plan** directive. |
@@ -643,12 +696,13 @@ pi update pi-rpac
 /reload                       # in a running session, to pick up code changes
 ```
 
-State is versioned (`version: 3` in each `workflow.json` and `state.json`). Versions 1 and 2 load
-as ordinary implementation workflows and migrate to the current shape; the legacy version-1
-shared layout is moved into a workflow directory with the migration recorded in its log. Version 3
-adds the workflow kind and durable review snapshot/coverage/check metadata. A version newer than
-the current one is rejected rather than silently discarding review state; corrupt files are
-quarantined under `.pi/rpac/quarantine/` and reported, never crash-looped.
+State is versioned. Ordinary workflows and the shared `state.json` index remain version 3.
+PR previews carrying the new execution policy use workflow version 4 so older engines fail closed
+rather than interpreting plan approval as host-execution permission. Versions 1 and 2 still load
+as ordinary implementation workflows; the legacy version-1 shared layout migrates with a log entry.
+Existing workflows and historical artifacts are not rewritten en masse. Unsupported future versions
+are rejected rather than stripped; corrupt files are quarantined under `.pi/rpac/quarantine/`
+and reported, never crash-looped.
 
 ---
 
@@ -780,10 +834,10 @@ pass stops the run; non-blocking observations do not.
 - **Ordinary REFINE and PLAN are mechanically read-only.** The extension permits only the exact
   phase artifact, conservative inspection, and known read-only tools. Ordinary ACT returns to
   normal Pi permissions.
-- **Review is mechanically report-only throughout.** Review ACT/CONSOLIDATE can write only the
-  current batch/report artifact and run exact approved non-destructive checks. Semantic review is
-  still model work: complete ledgers and adversarial validation improve reliability but cannot
-  prove a repository defect-free.
+- **Review remains advisory, not an auto-fix lane.** Model writes are limited to the exact phase
+  artifact; inspection is validated. PR host setup/checks require screening, separate user consent
+  and native recording. This code is not sandboxed and may have host side effects. Complete
+  ledgers and adversarial validation improve reliability, not proof that a repository is defect-free.
 - **No auto commit/push/merge/publish.** Consolidation reports; you decide.
 - **Snapshots are boundary checks, not continuous monitors.** Ordinary divergence and exact review
   drift are checked at lifecycle boundaries and completion, never auto-resolved. RPAC's own

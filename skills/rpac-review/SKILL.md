@@ -17,13 +17,59 @@ This bundled skill adapts Engineering in the age of AI's MIT-licensed
 The upstream copyright and license are preserved in [LICENSE](LICENSE). It is self-contained: no upstream or global
 review skill is needed at runtime.
 
-Use this skill only inside a workflow started by `/rpac review [current|staged|full]` **or** `/rpac start preview
-<pr-number>` (a GitHub PR review). The extension owns scope capture, fingerprints, approvals, coverage state, drift
+Use this skill only inside a workflow started by `/rpac review [current|staged|full]`, `/rpac preview <pr-number>`,
+or the legacy `/rpac start preview <pr-number>` entry point (a GitHub PR review). The extension owns scope capture, fingerprints, approvals, coverage state, drift
 checks, and write gates. The review is **report-only**: never edit reviewed files, related repositories, Git/index/remote
-state, or package/tool installations. Write only the exact RPAC artifact named by the active directive. Proposed fixes
+state through ordinary tools. Package installation is not allowed through the shell; only the separately approved
+native host-setup lane below may provision preview dependencies. Write only the exact RPAC artifact named by the active directive. Proposed fixes
 become a separate ordinary `/rpac start <task>` workflow.
 
-## PR REVIEW — GitHub pull request (`/rpac start preview <pr-number>`) additions
+## Screened host execution — optional PR preview lane
+
+A separate checkout is **not a sandbox**. Host scripts/dependencies can access files, credentials, services, network,
+and shared Git administration. Model/static screening cannot prove code safe. No Docker is used or required.
+
+During REFINE/PLAN, inspect actual script entry points, npm lifecycle scripts, project configuration and lockfiles for
+malicious behavior, unexpected writes, credential/network/service access and executable subprocesses. State exactly
+what was inspected and what was not (including downloaded dependencies and transitive imports). Confirmed malicious
+behavior or a material unresolved safety concern requires `do-not-run` and unavailable verification. Disclosed residual
+risks (such as uninspected dependency code) are not a safety proof: the user must knowingly decide whether to trust
+execution on the host. Never call those risks resolved merely because an approval was recorded.
+
+For code execution, `plan_complete` must include:
+- `reviewChecks`: exact prefixed test/build commands; useful `&&` combinations are supported.
+- `reviewExecution.setupCommands`: exact prefixed dependency setup commands, separate from checks. Initially supported
+  setup is `npm ci` with standard flags. Prefer `--ignore-scripts --no-audit --no-fund` where appropriate; do not hide
+  the fact that lifecycle hooks may execute when `--ignore-scripts` is omitted.
+- `reviewExecution.generatedPaths`: expected **untracked** output directories relative to the checkout, ending in `/`
+  (e.g. `node_modules/`, `dist/`, `coverage/`). Never use `.git`, `.pi`, absolute paths or traversal. This does not hide
+  tracked source changes or authorize writes outside the checkout.
+- `reviewExecution.screening`: `{summary, files, risks, recommendation: "run"|"do-not-run"}`. `summary` is a substantive
+  assessment (80–4000 characters); `files` names inspected checkout-relative source/config paths. Include package.json,
+  present lockfiles and .npmrc for npm/npx recipes. `risks` must honestly discuss unreviewed code and host access.
+
+Plan approval is **not host-execution approval**. Ask the user to inspect the screening and run `/rpac approve execution`
+(headless: `/rpac approve execution --yes`). The dialog discloses commands, files/hashes, risks and output directories.
+A `do-not-run` recommendation cannot be approved. Changed plan, inputs, checkout identity, scope or commands require
+new screening/approval. Never approve yourself or bypass a refusal with another tool, wrapper or shell.
+
+During an authorized ACT task, call `rpac` action `review_check` with `command` and `checkKind: "setup"|"check"`.
+Run setup and basic toolchain availability checks early, not only after the last source batch. Declared untracked
+outputs such as node_modules do not by themselves contaminate the pinned source; tracked changes still do.
+Successful setup is reused, not blindly repeated. Diagnose failures before retrying and retain every failed observation.
+Raw bash remains for inspection, not PR execution. Each native command has a ten-minute timeout.
+Setup may use networking; checks receive offline dependency-manager hints, **not an enforced network boundary**.
+The runner records full output, exact exit status, cancellation/unavailable outcomes and immutable approval evidence.
+Copy **every** returned actual observation and its log path into `task_done.verification`, plus a separate acceptance
+check for the review evidence. Do not mark deferred/not-run tests pass. Failures remain failures even if the review task
+itself completes. Never discard a failing setup/test outcome.
+
+Unexpected tracked-source or checkout changes invalidate review evidence; do not clean/revert them. Untracked files
+under approved output directories do not by themselves invalidate coverage. Cleanup remains stricter: `/rpac pr-cleanup`
+will not silently delete generated, ignored or untracked files. Preserve/inspect them and let the user remove them
+separately when appropriate. New runtime checks belong in ACT; consolidation uses saved logs or replans missing work.
+
+## PR REVIEW — GitHub pull request (`/rpac preview <pr-number>`) additions
 
 A PR review uses the same lifecycle, artifacts, and gates (REFINE / PLAN / ACT / adversarial
 validation / CONSOLIDATE), with a different scope source and a different trust posture. The
@@ -42,7 +88,7 @@ commit contents: merge-base and pinned PR head), not HEAD/index/worktree.
   for correctness. Treat context outside the `base...head` diff as context, not reviewed content, and do not claim it was
   reviewed unless it is an assigned manifest item.
 - **Verification directory.** Include the exact shell-quoted `cd -- '<checkoutLocation>' && ` prefix supplied by the
-  directive in EVERY planned `reviewChecks` command. Run that complete approved command through bash; bare commands,
+  directive in EVERY planned `reviewChecks` command. Use that complete command with native `review_check` for host code execution, or bash for pure inspection; bare commands,
   PowerShell execution, different prefixes, and subsequent shell directory switches are refused. Old PR plans without
   the prefix must be replanned. Missing, contaminated, or wrong-HEAD checkouts cannot supply verification evidence.
   Project scripts remain untrusted executable code; RPAC is not an OS sandbox. Use external isolation where needed.
@@ -112,7 +158,10 @@ rpac(action="plan_complete",
      reviewChecks=["exact command", ...])
 ```
 
-Use `reviewItemIds` only for manifest-backed coverage tasks. Do not alter commands after approval; a different command
+Use `reviewItemIds` only for manifest-backed coverage tasks. Write task headings as `### Task 1 — Title` and put an
+`Assigned manifest items:` block directly below, listing each ID on its own line (then a blank line). These explicit
+assignment blocks are checked against registered `reviewItemIds` before approval; keep them identical. Unstructured
+prose is not a substitute for canonical tool assignments or evidence of semantic agreement. Do not alter commands after approval; a different command
 requires replanning and user approval.
 
 ## 3. ACT — inspect one bounded batch
@@ -140,9 +189,10 @@ Maintain the named `review-batch-<id>.md` as a durable evidence ledger. For each
 - candidate finding IDs, or an explicit evidence-based “no candidate” result;
 - uncovered content or uncertainty.
 
-Run only read-only inspection commands or exact checks approved with the plan. Checks may generate caches/output; do not
-hide that—scope drift will expose shipping-file changes. Never configure, install, fetch, build, or contact a remote
-unless the exact non-destructive command was approved and permitted by the gate. A failed subject check is evidence, not
+Run only read-only inspection commands or exact checks approved with the plan. PR host code additionally needs the
+screening and separate user approval above, and runs only through native `review_check`. Checks may generate caches/output; do not
+hide that—scope drift will expose shipping-file changes. Never configure, install, fetch, build, or contact a remote through an unapproved path. Native PR setup/check recipes
+are the only new execution exception; this is user-authorized host code, not an OS sandbox. A failed subject check is evidence, not
 proof that the review task failed.
 
 A candidate finding must contain:
@@ -160,6 +210,9 @@ valid. If isolation/fresh subagents are unavailable, perform the pass in this se
 
 Finish only when all assigned IDs have ledger evidence. Call `task_done` with the batch artifact as the sole deliverable,
 a passing acceptance check that batch coverage/evidence is complete, and subject failures as `kind: "observation"`.
+After successful task_done in sequential mode, call task_start with task `next` **before inspecting or writing** the next
+batch. If the run is interrupted or this session has no execution lease, stop and ask the user for `/rpac act <id>` or
+`/rpac resume`; reading more files does not reauthorize a ledger write. Call rpac directly, not tools.rpac in codemode.
 Missing evidence is an acceptance failure. In sequential mode, call `task_start` only after `task_done` succeeds.
 
 ## 4. Adversarial validation task

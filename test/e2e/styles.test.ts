@@ -8,6 +8,8 @@ import { makeTempDir, removeTree } from "../../lib/util.ts";
 import { newState } from "../../lib/schema.ts";
 import { createWorkflow, updateActive } from "../../lib/store.ts";
 import { BUILTIN_STYLES, stylePaths } from "../../lib/styles.ts";
+import { acquireLock, refreshLock, releaseLock } from "../../lib/lock.ts";
+import { LEASE_NAME } from "../../lib/store.ts";
 import { extensionApiFor, fire, makeCommandCtx, makeMockPi, rpacCmd, rpacTool } from "../helpers/mock-pi.ts";
 
 async function fixture(run: (root: string, agent: string) => Promise<void>) {
@@ -56,11 +58,11 @@ test("immediate switching, reload/restart and handoff use disk without mutating 
 	const before = readFileSync(file, "utf8");
 	const user = { role: "user", content: [{ type: "text", text: "Continue" }], timestamp: 0 };
 	const first = await context(m, root, [user]);
-	assert.match(first.messages.at(-1).content, /preference — teacher/);
+	assert.match(first.messages.find(message => message.customType === "rpac-style").content, /preference — teacher/);
 	await rpacCmd(m, root, "style technical");
 	const technical = await context(m, root, first.messages);
 	assert.equal(technical.messages.filter((message) => message.customType === "rpac-style").length, 1);
-	assert.match(technical.messages.at(-1).content, /preference — technical/);
+	assert.match(technical.messages.find(message => message.customType === "rpac-style").content, /preference — technical/);
 	await rpacCmd(m, root, "style chill");
 	assert.match((await context(m, root)).messages[0].content, /preference — chill/);
 	assert.equal(readFileSync(file, "utf8"), before);
@@ -68,7 +70,7 @@ test("immediate switching, reload/restart and handoff use disk without mutating 
 	assert.deepEqual(m.userMessages, [], "no growing transcript of style commands");
 	m = runtime(); // new extension runtime / fresh session; no in-memory style cache
 	await fire(m, "session_start", {}, makeCommandCtx(m, root) as any);
-	assert.match((await context(m, root, [user])).messages.at(-1).content, /preference — chill/);
+	assert.match((await context(m, root, [user])).messages.find(message => message.customType === "rpac-style").content, /preference — chill/);
 	// Compaction discards previous context; the next invocation still resolves disk.
 	assert.match((await context(m, root, [])).messages[0].content, /preference — chill/);
 	await rpacCmd(m, root, "handoff", { hasUI: false });
@@ -157,6 +159,34 @@ test("status summaries preserve failures; detailed and Technical status expose e
 	await rpacCmd(m, root, "style technical");
 	const technical = (await rpacCmd(m, root, "status")).ui.text("info").join("\n");
 	assert.match(technical, /check: acceptance npm test — fail: exit 1/);
+}));
+
+test("runtime guidance stays before the user turn, refreshes sequential task state and explains interruption", () => fixture(async (root) => {
+	const m = runtime();
+	const state = newState(root, "Replay task transitions"); state.phase = "act"; state.approvals.sequential = true;
+	state.tasks = [{ id: 1, title: "First task", status: "in_progress" }, { id: 2, title: "Second task", status: "pending" }];
+	createWorkflow(root, state, true);
+	const user = { role: "user", content: "Continue the approved work", timestamp: 0 };
+	const reply = { role: "assistant", content: [], timestamp: 1 };
+	const result = { role: "toolResult", toolCallId: "test-call", toolName: "read", content: [{ type: "text", text: "source" }], isError: false, timestamp: 2 };
+	acquireLock(root, LEASE_NAME, { record: { workflowId: state.id, taskId: 1 } });
+	try {
+		const initial = await context(m, root, [user, reply, result]);
+		assert.equal(initial.messages[0].customType, "rpac-style");
+		assert.deepEqual(initial.messages.slice(1), [user, reply, result], "no fresh user reminder after tool results");
+		assert.match(initial.messages[0].content, /Installed RPAC runtime guidance.*not PR source/);
+		assert.match(initial.messages[0].content, /current task #1/);
+		updateActive(root, (s) => { s.tasks[0].status = "done"; s.tasks[1].status = "in_progress"; });
+		refreshLock(root, LEASE_NAME, { taskId: 2 });
+		const next = await context(m, root, initial.messages);
+		assert.equal(next.messages.filter(message => message.customType === "rpac-style").length, 1);
+		assert.match(next.messages[0].content, /current task #2/);
+		assert.doesNotMatch(next.messages[0].content, /current task #1/);
+	} finally { releaseLock(root, LEASE_NAME); }
+	updateActive(root, (s) => { s.tasks[1].status = "interrupted"; });
+	const stopped = await context(m, root, [user, reply, result]);
+	assert.match(stopped.messages[0].content, /No execution lease is owned here/);
+	assert.match(stopped.messages[0].content, /user must run \/rpac act or \/rpac resume/);
 }));
 
 test("malformed config warns once per runtime with recovery, not on every tool round", () => fixture(async (root, agent) => {

@@ -438,7 +438,7 @@ export function taskDone(
 	if (remaining.length === 0) {
 		message += " All tasks complete. Run /rpac consolidate to verify the outcome and write the report.";
 	} else if (s.approvals.sequential) {
-		message += " Continue with the next ready task.";
+		message += ' Before any work on the next task, call rpac task_start with task "next". Continue only if it succeeds.';
 	} else {
 		message += " Stop and wait for /rpac act (or /rpac act --sequential) before the next task.";
 	}
@@ -491,6 +491,7 @@ export function replaceReviewScope(s: RpacState, update: ReviewScopeUpdate): Mac
 	s.review.scopeItemIds = [...new Set(update.scopeItemIds)];
 	s.review.coveredItemIds = [];
 	s.review.uncoveredItemIds = [];
+	if (s.review.execution) s.review.execution.approval = undefined;
 	s.review.exclusions = update.exclusions.map((entry) => ({ ...entry }));
 	s.review.drift = undefined;
 	s.artifacts.reviewManifest = { ...update.manifest };
@@ -762,6 +763,7 @@ export function backToPlan(s: RpacState, reason: string): MachineResult {
 	s.phase = "plan";
 	s.approvals.plan = false;
 	s.artifacts.plan = undefined;
+	if (s.review?.execution) s.review.execution.approval = undefined;
 	s.tasks = s.tasks.map((t) => (t.status === "done" ? t : { ...t, status: "pending" as const, issues: undefined }));
 	pushEvent(s, "phase", `→ plan (re-plan): ${reason.trim()}`);
 	return {

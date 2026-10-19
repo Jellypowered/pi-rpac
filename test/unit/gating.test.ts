@@ -147,6 +147,14 @@ test("unreadable RPAC state fails closed for mutation tools", () => {
 const SAFE: [string, string][] = [
 	["simple read", "cat src/app.ts"],
 	["grep", "grep -r todo src/"],
+	["ripgrep", "rg --no-config -n 'gh pr view|rm -rf' src"],
+	["literal grep operations", "grep -i 'gh \\|execFile\\|rm' lib/pr.ts"],
+	["sed numeric range", "sed -n '1,10p' file.txt"],
+	["composed inspection", "git status && sed -n '1,10p' lib/pr.ts && rg -n todo src"],
+	["git version", "git --version"],
+	["git worktree listing", "git worktree list --porcelain -z"],
+	["git untracked listing", "git ls-files -o --exclude-standard"],
+	["locale assignment", "LC_ALL=C grep needle src/app.ts"],
 	["ls", "ls -la"],
 	["find", "find . -name '*.ts'"],
 	["git status", "git status"],
@@ -221,7 +229,13 @@ const BLOCKED: [string, string][] = [
 	["date set", "date --set tomorrow"],
 	["file compile", "file --compile magic"],
 	["npm list disallowed", "npm list"],
-	["sed disallowed", "sed -n '1,10p' file.txt"],
+	["sed execute", "sed -n '1e touch marker' file.txt"],
+	["sed write", "sed -n '1w output.txt' file.txt"],
+	["sed script file", "sed -n -f commands.sed file.txt"],
+	["ripgrep preprocessor", "rg --pre 'touch marker' text"],
+	["ripgrep hostname command", "rg --hostname-bin=touch text"],
+	["ripgrep injected config", "RIPGREP_CONFIG_PATH=malicious rg needle src"],
+	["path override", "PATH=. rg needle src"],
 	["substitution write", "echo $(date) > stamp.txt"],
 	["double-quoted substitution", "echo \"$(touch marker)\""],
 	["process substitution", "cat <(python -c 'open(\"x\",\"w\")')"],
@@ -249,8 +263,8 @@ test("gate blocks mutating bash in refine/plan and allows read-only bash", () =>
 
 test("shell denials identify the first rejected segment and rejection class", () => {
 	const s = state("refine");
-	const unknown = gateToolCall(s, ROOT, "bash", { command: "git status && rg -n todo src" }, ROOT);
-	assert.match(unknown!.reason, /not on the read-only allowlist: rg -n todo src/);
+	const unknown = gateToolCall(s, ROOT, "bash", { command: "git status && unsupported-inspector src" }, ROOT);
+	assert.match(unknown!.reason, /not on the read-only allowlist: unsupported-inspector src/);
 	assert.match(unknown!.reason, /every segment of a compound command must qualify/);
 
 	const redirected = gateToolCall(s, ROOT, "bash", { command: "grep todo src > findings.txt" }, ROOT);

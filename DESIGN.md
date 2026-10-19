@@ -63,8 +63,8 @@ duplicate Pi's native mechanisms and lose approval/state enforcement.
   messages while Pi restores its system/tool messages. A `custom` message converts to user-role
   content, not a system instruction. Used for dynamically resolved communication preferences.
   Verified against development Pi 1.1.0 and installed Pi 1.3.0 declarations, runner and message conversion.
-- `pi.on("before_agent_start", ...)` returning `{message: {customType, content, display:
-  false}}` — tiny per-turn phase context (see §2.6).
+- Runtime phase/style guidance uses `context` rather than a persisted `before_agent_start` message
+  (see §2.6). It is refreshed on tool continuations and placed before the latest real user turn.
 - `pi.on("agent_end" | "session_start" | "session_shutdown", ...)` — lifecycle for lease
   release and honest interruption recording (see §2.5).
 - `ctx.newSession({withSession})` — explicit fresh-session handoff.
@@ -84,6 +84,9 @@ pi-rpac/
 │   ├── store.ts          # .pi/rpac IO: index, per-workflow dirs, v1 migration, quarantine
 │   ├── lock.ts           # atomic wx lock + ACT lease, stale takeover, pid liveness (pure)
 │   ├── gating.ts         # planning + all-phase report-only review gates (pure)
+│   ├── shell.ts          # literal shell segments/words; no evaluation
+│   ├── review-plan.ts    # explicit written/registered assignment agreement
+│   ├── execution.ts      # screened host consent, input hashes, native evidence policy
 │   ├── git.ts            # ordinary baseline/divergence detection (excludes .pi/)
 │   ├── review.ts         # byte-safe Git snapshots, manifests, fingerprints, drift (pure)
 │   ├── pr.ts             # GitHub PR review: gh resolution, safe checkout, base...head scope (pure)
@@ -104,7 +107,12 @@ pi-rpac/
 **Layering:** `lib/` is pure TypeScript (node builtins only) → unit-testable with plain node.
 `extensions/rpac.ts` is the only file that touches Pi APIs.
 
-### 2.1 State — v3 per-workflow layout (project root = git root, else cwd)
+### 2.1 State — versioned per-workflow layout (project root = git root, else cwd)
+
+Ordinary workflows and the index remain v3. PR previews carrying the new execution policy use
+workflow v4 so older v3 engines reject them without losing the shared index/active pointer.
+`review.execution` has its own v1 profile (screening, setup/output declarations, consent and runs).
+Existing saved workflows/artifacts are not rewritten en masse.
 
 ```
 <repo>/.pi/rpac/
@@ -118,6 +126,8 @@ pi-rpac/
 │   ├── review-manifest.json  # review workflow: deterministic scope
 │   ├── review-batch-<id>.md  # review workflow: hashed task evidence
 │   ├── review-report.md      # review workflow: final hashed deliverable
+│   ├── host-approval-*.json  # optional PR host consent: immutable, hashed evidence
+│   ├── review-check-*.log   # optional native setup/check stdout + stderr + outcome
 │   └── handoff.md
 ├── quarantine/       # corrupt files, preserved + surfaced as notes
 ├── .lock             # state write lock: {token, pid, createdAt, refreshedAt?, ...}
@@ -182,7 +192,8 @@ coverage to complete or silently changes scope.
 
 ### 2.2b PR review (`mode: "pr"`) — GitHub pull requests
 
-`/rpac start preview <pr-number>` reviews a GitHub PR rather than the local work tree. It reuses
+`/rpac preview <pr-number>` reviews a GitHub PR in a separate worktree rather than switching the
+local work tree. `/rpac start preview <number>` remains compatible with legacy checkout selection. It reuses
 the exact review lifecycle (phases, approvals, leases, report-only gates, manifest/coverage,
 drift, evidence batches, `review-report.md`) with PR-specific prompts and a distinct scope source.
 `lib/pr.ts` is pure and drives `gh` through an injectable `GhRunner` interface so tests run against
@@ -191,27 +202,37 @@ a mock CLI (no network, no real GitHub).
 - **Metadata resolution** (`gh pr view --json ...`): number, URL, title, body, state, base/head
   refs + SHAs, head-repository owner, and the cross-repository (fork) flag. A missing/unreadable PR,
   non-integer number, or invalid SHA is a clean error before any state is written.
-- **Safe checkout.** The PR head must be reviewable locally. `assessPrCheckout` inspects the work
-  tree:
+- **Safe checkout.** The dedicated preview command always selects a separate worktree, including
+  from a clean main tree. The legacy entry point retains `assessPrCheckout` selection:
   - **in-place** (clean tree): `gh pr checkout` fetches the PR head ref and the work tree is checked
     out **detached onto the exact head SHA**. The original branch/HEAD/dirty list is recorded first
     so nothing is lost.
-  - **worktree** (dirty tree): a `git worktree` is created at a deterministic sibling path, fetched
-    to the head ref, and checked out detached there — the main work tree is left byte-for-byte
+  - **worktree** (dedicated command, or dirty legacy tree): a `git worktree` is created at a deterministic sibling path
+    (or a generated eight-hex suffix when that missing path is still registered), fetched to the
+    head ref, and checked out detached there — the main work tree is left byte-for-byte
     untouched. `/rpac pr-cleanup` removes only that worktree after checking its Git registration,
     common repository, administrative ownership record, pinned HEAD, and clean status including
     ignored/untracked files. Symlinked paths, hidden index flags, and unowned/legacy directories
     are refused. Removal uses ordinary `git worktree remove`, never force or filesystem fallback.
+    Missing registered directories are not automatically pruned: their index/reflog/ownership and
+    locks may still matter. A fresh preview chooses an unused sibling instead. Validation and
+    cleanup use the recorded canonical-or-generated path, not a recomputed default; common-repo,
+    registration, ownership, HEAD and cleanliness checks still apply.
   - Objects and the merge-base diff are preflighted before checkout. The checkout's actual HEAD
-    is asserted equal to the resolved head SHA before the workflow is persisted.
+    is asserted equal to the resolved head SHA before the workflow is persisted. Native PR Git
+    calls/baselines/status suppress `core.hooksPath` and `core.fsmonitor`; gh receives final Git
+    environment overrides too (legacy inline `GIT_CONFIG_PARAMETERS` are not inherited there).
+    Installed credential/transport/content-filter helpers remain trusted host tooling. Raw shell
+    classification does not isolate arbitrary configured Git plugins or branch-relative drivers.
 - **Scope = `base...head`.** `capturePrSnapshot` diffs the pinned base and head commits by object
   (not by work tree), producing the same manifest-item shape as `review.ts` but with `base` and `pr`
   content layers. `base` is read from the unique merge-base, NOT the base tip. Byte-keyed `ls-tree`
   maps and the shared blob reader preserve raw path identities, modes, symlinks, and gitlinks.
   Added/modified/deleted/renamed files are all represented; fork PRs work because the head is
   fetched via the base repository's PR ref. Both commits must exist locally or the start fails cleanly.
-- **Untrusted input, report-only.** The PR is someone else's diff. Execution stays mechanically
-  report-only in every phase (the all-phase review gate). Native preparation/freshness uses only
+- **Untrusted input, report-only outcome.** The PR is someone else's diff. Model source/Git writes
+  remain gated in every phase. Screened host setup/check execution requires separate consent
+  (below); it is not permission to fix the PR. Native checkout preparation/freshness uses only
   `gh --version`, `gh auth status`, `gh pr view`, `gh pr checkout --detach`, and Git fetch. No `gh pr
   review/merge/close/create`, no `api` mutation, no posting of findings to GitHub. The report is
   advisory.
@@ -223,7 +244,29 @@ a mock CLI (no network, no real GitHub).
   prefix as part of the exact user-approved command. The gate refuses unqualified checks,
   directory-switch suffixes, and PowerShell execution of POSIX checks; it also validates the
   checkout before dispatch. Direct `gh` and known Git-state mutations stay blocked even if
-  listed in a plan. Approved scripts are not an OS sandbox; external isolation remains a user choice.
+  listed in a plan. Raw shell can inspect; executable PR recipes must use the native host lane.
+- **Screened host lane** (`lib/execution.ts`, bounded recipes in `lib/gating.ts`). `plan_complete.reviewExecution`
+  supplies exact `setupCommands`, relative untracked `generatedPaths` and `screening`
+  (`summary`, inspected `files`, `risks`, `recommendation`). SHA-256 binds inspected file bytes.
+  Plan-time validation rejects unsupported recipes, missing npm metadata/lockfiles/scripts and
+  explicit assigned-ID blocks that disagree with registered `reviewItemIds` (`lib/review-plan.ts`).
+  A `do-not-run` recommendation cannot be approved. `/rpac approve execution` is distinct from
+  plan approval, needs `--yes` headlessly, and writes a hashed consent artifact with commands,
+  screening, identities and risks. The digest binds the profile version, plan, scope, PR/head,
+  commands, inspected hashes and output directories. It is revalidated before every dispatch.
+  `rpac review_check` requires this runtime's ACT lease and an in-progress task; only it launches
+  the registered code. Setup initially supports constrained `npm ci`. Checks use bounded
+  npm/npx/node/pytest/Cargo/Go/make recipes, not arbitrary shell evaluation. Each command has a
+  600-second timeout; full output/launcher/environment hints/exit status are saved before a real
+  observation is returned. Successful setup is reused. A persisted running result after a crash
+  blocks replay. Failure/cancellation/unavailability remain evidence; task completion must include
+  actual execution observations and explicitly mark planned but unrun runtime checks unavailable.
+- **No sandbox claim.** Worktrees share Git administration. Consented code has the user's host
+  access, including credentials, filesystem, services and networking. Screening is an assessment,
+  not proof. No Docker is required or provisioned. Setup networking is expected; check execution
+  sets offline dependency-manager hints but cannot enforce a network boundary. Explicit generated
+  directories tolerate untracked outputs without ignoring tracked changes; cleanup still refuses
+  generated/ignored/untracked data rather than deleting it. Host-code side effects are not rolled back.
 - **Failure/concurrency.** Objects and the full diff are preflighted before checkout. Safety is
   reassessed after acquiring the control lease; fetch errors cannot reuse stale refs. In-place
   failures restore the original branch/commit only when safe without forcing; otherwise they
@@ -249,6 +292,9 @@ a mock CLI (no network, no real GitHub).
   bound to the active workflow/task for model task mutations. Replacement, switching, pause,
   abort, and cleanup take a short control lease and therefore refuse while ACT is live. Takeover
   requires a provably dead holder pid, so age alone never displaces a live executor.
+  The extension also tracks which runtime acquired ACT: a second runtime in the same process
+  cannot borrow the lease for native execution/task mutations/ledger writes or release/interrupt
+  the owner's run via its own `agent_end` or `session_shutdown` hook.
 
 Consequences, tested with real child processes: two racers on one lock → exactly one winner;
 two racers on one stale lock → exactly one taker; N writers doing load-mutate-save under the
@@ -312,24 +358,29 @@ workflows are gated in REFINE/PLAN; review workflows are gated in every non-term
   of a pipeline/list must be allowed; redirection and mutation-capable variants such as
   `find -delete/-exec`, `git remote add`, output-file options, interpreters, package managers,
   and network clients are blocked.
-- Known inspection tools (`read`, `grep`, `find`, `ls`), `codemode`, and the non-mutating
+- Known inspection tools (`read`, `grep`, `find`, `ls`), session-local `todo`, `codemode`, and the non-mutating
   `ask_user_question` tool pass; nested calls made by `codemode` are gated independently. Any
   other custom tool is blocked. Ordinary ACT/consolidate use normal Pi permissions.
 - Review writes are limited by phase to `requirements.md`, `plan.md`, the current
   `review-batch-<id>.md`, or `review-report.md`. This blocks source, sibling-repository, and wrong
   artifact writes throughout review execution.
-- Review shell use is read-only inspection plus exact command strings stored as `approvedChecks`
-  with the user-approved plan. A destructive denylist still wins over approval; package installs,
-  Git/remote mutations, output redirection, and unknown commands fail closed.
+- Review shell inspection validates literal segments and executable words rather than treating
+  quoted search data as commands. Safe `rg`, numeric-range `sed -n`, Git metadata/listing and
+  validated `&&`/pipeline compositions work; dangerous options, substitutions, environment
+  overrides, redirects and unknown forms fail closed. PR host recipes require the separately
+  consented native lane; plan approval cannot override the raw-shell gate.
 - The gate reads state lock-less (`peekActive`) so it adds no latency. If RPAC state exists but
   cannot be validated, mutation tools fail closed rather than running without policy.
 
 ### 2.6 Context efficiency & session integration
 
-- **Per-turn context** (`before_agent_start`): a 3–4 line `[RPAC] phase=…` block with the
-  exact artifact paths, current task, and the tool action to call. It is omitted entirely
-  when there is no workflow, the workflow is terminal, or it is paused — idle turns cost
-  nothing.
+- **Request-local context** (`context`): one RPAC-owned hidden custom message combines installed
+  runtime guidance and presentation preference before the latest real user turn, never after tool
+  results. It refreshes actual task/lease state before every invocation. Old RPAC style/context
+  messages are removed defensively, while other messages retain order. No message is appended to
+  durable session history. Paused/terminal/missing workflows inject nothing. Sequential guidance
+  requires the previous owned task to have passed and another task to be ready; failures and
+  interruptions stop task work rather than inviting unauthorized inspection or ledger writes.
 - **Phase directives** (via `sendUserMessage(followUp)`): short, workflow-kind-specific messages
   name the phase, exact artifact, skill, manifest/task IDs where relevant, and tool action.
   Behavioral detail lives in five skills (including `rpac-review`) loaded on demand.
@@ -395,13 +446,15 @@ Validation bounds: file 64 KiB; 32 styles per file; identifier 48 characters; na
 control characters, symlinked files and symlinked write directories are checked. Identifiers never
 become file paths. No custom imports, file references, templates or executable configuration exist.
 
-**Supported Pi hooks, not rendered-output rewriting.** The existing `before_agent_start` phase
-pointer remains unchanged. A separate `context` hook reads actual disk workflow state and preferences
-before *each* model invocation, including tool continuations. It supplies one hidden request-local
+**Supported Pi hooks, not rendered-output rewriting.** A single `context` hook reads actual disk
+workflow/lease state and preferences before *each* model invocation, including tool continuations.
+This replaces the stale persisted `before_agent_start` task pointer. It supplies one hidden request-local
 `rpac-style` custom message only for non-paused, non-terminal workflows. Pi converts it to user-role
 content. It never returns `systemPrompt`, changes structured system-prompt sections, uses
 `context_with_system`, changes tool declarations or transforms assistant output. Existing messages and
-other extensions' messages are preserved; any prior RPAC-owned style message is removed defensively.
+other extensions' messages are preserved; prior RPAC-owned style/phase pointers are removed defensively.
+Guidance is explicitly installed runtime policy rather than PR content; it is applied silently, and
+its placement does not masquerade as a fresh user request after each tool result.
 The message is not appended to session history, so compaction and handoff cannot accumulate stale
 style instructions. Disk resumption supplies the current voice. Unreadable state means no style
 injection; the existing tool gate continues to fail closed. Preference warnings are deduplicated per

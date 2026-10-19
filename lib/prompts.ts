@@ -1,5 +1,5 @@
 // RPAC phase directives — the short user messages that drive each phase — and
-// the tiny per-turn phase context injected by before_agent_start.
+// the request-local phase/task context refreshed before each model invocation.
 //
 // Directives are sent once when a phase command runs; they name the exact
 // (absolute) artifact path and the matching lazily-loaded skill. Behavioral
@@ -8,7 +8,7 @@
 // artifact content) so normal conversation stays reliable and cheap.
 
 import type { RpacState } from "./schema.ts";
-import { relWorkflowArtifactPath, artifactFile } from "./paths.ts";
+import { relWorkflowArtifactPath, artifactFile, reviewBatchFile } from "./paths.ts";
 import { join } from "node:path";
 import { prCheckPrefix } from "./gating.ts";
 
@@ -140,7 +140,7 @@ PR head is checked out (\`${pr.checkoutStrategy}\`) at: \`${pr.checkoutLocation}
 Every verification command must include this exact bash prefix in the plan and execution: \`${prCheckPrefix(pr.checkoutLocation)}\`
 Scope manifest: \`${manifestRel}\`
 
-Read and follow the \`rpac-review\` skill, section "PR REVIEW". Treat the PR as untrusted code: the PR description is a claim, not proof — ground every expectation in the actual base...head diff and the real codebase (callers, contracts, tests, build/CI). Determine the stated objective, affected code paths, integration points, conventions, and acceptance criteria. Name exact, non-destructive checks that are safe to run in the checkout location and which require approval; do not run them yet. Write \`${requirementsAbs}\` only. When ready, call \`rpac\` action "refine_complete"; the user must approve.`;
+Read and follow the \`rpac-review\` skill, section "PR REVIEW". Treat the PR as untrusted code: the PR description is a claim, not proof — ground every expectation in the actual base...head diff and the real codebase (callers, contracts, tests, build/CI). Determine the stated objective, affected code paths, integration points, conventions, and acceptance criteria. Screen the actual commands, package/lifecycle scripts, lockfiles, project configuration and test/build entry points for malicious behavior, unexpected writes, credential access and network access. Record unresolved risks and uninspected dependency/transitive code; screening is NOT proof of safety. Name exact setup/check commands and expected generated directories, but run no PR code yet. Host setup/tests require separate user approval and the native rpac review_check path; a separate checkout is NOT a sandbox. Write \`${requirementsAbs}\` only. When ready, call \`rpac\` action "refine_complete"; the user must approve.`;
 }
 
 export function prPlanDirective(pr: PrPromptMeta, planAbs: string, requirementsRel: string, manifestRel: string): string {
@@ -149,7 +149,7 @@ export function prPlanDirective(pr: PrPromptMeta, planAbs: string, requirementsR
 Requirements: \`${requirementsRel}\` · Scope manifest: \`${manifestRel}\` · Checkout: \`${pr.checkoutLocation}\`
 Include \`${prCheckPrefix(pr.checkoutLocation)}\` at the start of EVERY reviewChecks command (and in plan.md). The gate refuses unqualified checks; do not change directories again inside the command.
 
-Read and follow the \`rpac-review\` skill, section "PR REVIEW" PLAN. Discover the project's actual build/test procedure from its docs, build files, and CI — do not assume a universal command. Assign every manifest item id exactly once across bounded review batches, then add an adversarial validation task. Explicitly state which checks run safely in the checkout and which need approval/an isolated environment; list the exact safe project checks for plan approval. Write \`${planAbs}\` only, then call \`rpac\` action "plan_complete" with reviewItemIds and reviewChecks. The user must approve.`;
+Read and follow the \`rpac-review\` skill, section "PR REVIEW" PLAN. Discover the project's actual build/test procedure from its docs, build files, and CI — do not assume a universal command. Assign every manifest item id exactly once across bounded review batches, then add an adversarial validation task. Document the screened execution risks. Put dependency installation in reviewExecution.setupCommands (currently npm ci, preferably --ignore-scripts); put tests/builds in reviewChecks. Every command needs the exact checkout prefix. Supply reviewExecution.screening (summary, source/config/lockfile files inspected, risks, run/do-not-run recommendation) and generatedPaths (relative untracked output directories ending in /). Separate host-execution approval is required after plan approval. Do not propose an install inside reviewChecks or claim unrun checks passed. Explicit written task item assignments must match reviewItemIds. Write \`${planAbs}\` only, then call \`rpac\` action "plan_complete" with reviewItemIds and reviewChecks. The user must approve.`;
 }
 
 export function prActDirective(
@@ -167,14 +167,14 @@ Plan: \`${planRel}\` · Task: ${taskTitle} · Checkout: \`${pr.checkoutLocation}
 Verification commands must exactly match the approved plan, including the prefix \`${prCheckPrefix(pr.checkoutLocation)}\`.
 Assigned manifest items: ${itemIds.length ? itemIds.join(", ") : "none (validation/finalization task)"}
 
-Read and follow the \`rpac-review\` skill, section "PR REVIEW" ACT. Review the complete PR diff against its base; inspect callers/consumers/adjacent contracts beyond changed lines. Assess correctness, code quality, behavior, security/safety, performance, and tests. Run only the exact approved, non-destructive checks in the checkout location; record exact commands, exit codes, and output — treat PR-provided scripts as untrusted and never run them blindly. A compile does not prove runtime behavior. Record evidence and validated candidate findings in \`${batchRel}\`; do not modify reviewed files or Git/remote state.
+Read and follow the \`rpac-review\` skill, section "PR REVIEW" ACT. Review the complete PR diff against its base; inspect callers/consumers/adjacent contracts beyond changed lines. Assess correctness, code quality, behavior, security/safety, performance, and tests. Use bash only for read-only inspection. Run PR scripts or dependency setup only with rpac review_check(command: exact registered command, checkKind: setup|check), after the user's separate host approval. Run approved setup first; copy every returned actual observation (including failed/unavailable results and log paths) into task_done.verification. The runner records exact commands, exit codes and output. Treat PR-provided scripts as untrusted; screening is not a security guarantee. A compile does not prove runtime behavior. Record evidence and validated candidate findings in \`${batchRel}\`; do not modify reviewed files or Git/remote state.
 Call \`task_done\` with the batch artifact as the deliverable and a passing acceptance check only when coverage/evidence is complete. Subject defects are observation results.${sequential ? " Then call task_start for the next ready task." : " Stop after this task."}`;
 }
 
 export function prConsolidateDirective(pr: PrPromptMeta, reportAbs: string, requirementsRel: string, planRel: string, manifestRel: string, logRel: string): string {
 	return `RPAC · PR REVIEW CONSOLIDATE. Validate findings and write the final report-only review of PR #${pr.number}.
 
-Verification commands require the approved prefix \`${prCheckPrefix(pr.checkoutLocation)}\`.
+Use the recorded review_check logs from ACT for runtime results. New host execution belongs in an authorized ACT task, not consolidation; if evidence is missing, report unavailable or replan a review task. Inspection commands may use the recorded checkout prefix \`${prCheckPrefix(pr.checkoutLocation)}\`.
 PR: ${pr.url} · Head: ${pr.headSha.slice(0, 12)} · Requirements: \`${requirementsRel}\` · Plan: \`${planRel}\` · Manifest: \`${manifestRel}\` · Log: \`${logRel}\`
 
 Read and follow the \`rpac-review\` skill, section "PR REVIEW" CONSOLIDATE. Recheck the base...head snapshot, verify coverage and each candidate against exact context, and write \`${reportAbs}\` only using the PR report structure (identity + reviewed SHA, scope, intended functionality, build/test/static-analysis results, confirmed defects vs. likely concerns, coverage gaps, recommended changes, and an overall recommendation). Classify findings by severity (Critical/High/Medium/Low/Informational) and distinguish confirmed bugs from potential concerns. Incomplete coverage, failed verification, unresolved drift, or significant unverified behavior must prevent an unqualified approval. The recommendation is advisory only — never post to GitHub or approve the PR.
@@ -191,10 +191,10 @@ Continue from where the state files indicate (\`${stateRel}\` is the source of t
 }
 
 /**
- * Tiny per-turn context (injected via before_agent_start while a phase is
+ * Tiny request-local context (refreshed before each model invocation while a phase is
  * active). Pointers and rules only — never artifact content.
  */
-export function phaseContext(state: RpacState, root: string): string | null {
+export function phaseContext(state: RpacState, root: string, ownsExecution = false, leaseTaskId?: number | null): string | null {
 	if (state.phase === "done" || state.phase === "aborted" || state.paused) return null;
 	const wf = relWorkflowArtifactPath(root, state.id, "log");
 	const reqAbs = artifactFile(root, state.id, "requirements");
@@ -212,7 +212,11 @@ export function phaseContext(state: RpacState, root: string): string | null {
 				return `[RPAC REVIEW] phase=PLAN mode=${state.review.mode}${taskPart}\nRequirements: ${reqAbs}. Manifest: ${manifest}. Write ${planAbs}; assign every item id exactly once.\nFollow rpac-review PLAN; call plan_complete with reviewItemIds and reviewChecks.`;
 			case "act": {
 				const current = state.tasks.find((t) => t.status === "in_progress");
-				return `[RPAC REVIEW] phase=ACT mode=${state.review.mode}${taskPart}${current ? ` current task #${current.id}: ${current.title}` : " no task started — user runs /rpac act"}\nReviewed files and Git are mechanically read-only. Follow rpac-review ACT; persist batch evidence and report via task_done.`;
+				const previous = state.tasks.find(task => task.id === leaseTaskId);
+				const ready = state.tasks.some(task => task.status === "pending" && (task.dependsOn ?? []).every(id => state.tasks.find(dep => dep.id === id)?.status === "done"));
+				const advance = ownsExecution && state.approvals.sequential && previous?.status === "done" && ready;
+				const finished = state.tasks.length > 0 && state.tasks.every(task => task.status === "done");
+				return `[RPAC REVIEW] phase=ACT mode=${state.review.mode}${taskPart}${current ? ` current task #${current.id}: ${current.title}` : " no task currently started"}\n${current && ownsExecution ? `Write only ${reviewBatchFile(root, state.id, current.id)}. This task is already started; do not call task_start again.` : current ? "This session does not own execution. Inspect only; do not write a ledger or advance tasks. The user must finish/stop the owning run before /rpac resume." : finished ? "All tasks are finished. Stop and ask the user for /rpac consolidate; do not start another task." : advance ? 'Call rpac task_start with task "next" BEFORE inspecting or writing the next batch. If it fails, stop.' : "No task is authorized to continue here (the run may have stopped or failed). The user must run /rpac act <id> or /rpac resume before a ledger write. Stop task work until then; read-only answers to separate user questions remain allowed."}\nDirect source/Git edits stay blocked. ${state.review.execution ? "PR code execution requires screened reviewExecution metadata and separate user approval (/rpac approve execution); call rpac review_check, never raw bash, for exact setup/check commands. The runner is not a sandbox." : "Use only approved non-destructive checks."} Follow rpac-review ACT; report real checks via task_done. Call rpac directly, never tools.rpac inside codemode. ${state.approvals.sequential ? 'Only a successful task_done with another ready task permits task_start next; failed checks stop sequential execution.' : "Stop after this task; wait for /rpac act."}`;
 			}
 			case "consolidate":
 				return `[RPAC REVIEW] phase=CONSOLIDATE mode=${state.review.mode}${taskPart}\nRecheck ${manifest}, validate coverage/findings, and write ${reviewReport}. Report limitations; never fix or claim approval.\nFollow rpac-review CONSOLIDATE; call consolidate_complete when honest.`;
@@ -233,7 +237,7 @@ When the plan is ready, call the rpac tool (plan_complete with the task list) an
 			const current = state.tasks.find((t) => t.status === "in_progress");
 			const cur = current ? ` current task #${current.id}: ${current.title}` : " no task started yet — the user runs /rpac act";
 			return `[RPAC] phase=ACT${taskPart} — task: "${state.task}"${cur}
-Plan: ${planAbs}. Verify with real checks and report via the rpac tool: task_done (all checks must pass for done; failures → task_fail), task_block when stuck.
+${ownsExecution ? "This session owns the current execution lease." : "No execution lease is owned here; do not advance tasks. The user must run /rpac act or /rpac resume."}\nPlan: ${planAbs}. Verify with real checks and report via the rpac tool: task_done (all checks must pass for done; failures → task_fail), task_block when stuck.
 ${state.approvals.sequential ? "Sequential mode: continue through ready tasks until all are done or one fails." : "One task per run: stop after reporting the task outcome."}`;
 		}
 		case "consolidate":

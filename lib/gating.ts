@@ -1,11 +1,12 @@
-// Read-only gating for the REFINE and PLAN phases (mechanically enforced).
+// Read-only planning and all-phase report-only review gating (mechanically enforced).
 //
 // During REFINE and PLAN the model may investigate freely, but may only write
 // the single workflow artifact the current phase allows (refine →
 // requirements.md, plan → plan.md). Application-code mutation through the
 // built-in write/edit tools is blocked, and bash is restricted to a
-// fail-closed read-only command policy. ACT and CONSOLIDATE run under normal
-// Pi permissions (no gating).
+// fail-closed read-only command policy. Ordinary ACT/CONSOLIDATE use normal Pi
+// permissions. Reviews retain source/Git guards in every phase; separately
+// consented PR host execution uses the native runner, never a raw-shell bypass.
 //
 // The gate hooks Pi's `tool_call` event, which also fires for nested
 // (tool-issued / codemode) calls, so those are covered too.
@@ -14,6 +15,7 @@
 // (itself inherited from Pi's plan-mode example extension).
 import { isAbsolute, resolve, join } from "node:path";
 import type { RpacState } from "./schema.ts";
+import { shellSegments, shellWords, inspectionSpecialCase } from "./shell.ts";
 import { artifactFile, reviewBatchFile, reviewReportFile } from "./paths.ts";
 
 const DESTRUCTIVE_PATTERNS: RegExp[] = [
@@ -125,57 +127,6 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*false\b/,
 ];
 
-/** Split an ordinary shell command list without treating quoted/escaped metacharacters as separators. */
-function shellSegments(command: string): string[] | null {
-	const segments: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | null = null;
-	let escaped = false;
-	const flush = () => {
-		if (current.trim()) segments.push(current.trim());
-		current = "";
-	};
-	for (let i = 0; i < command.length; i++) {
-		const ch = command[i]!;
-		if (escaped) {
-			current += ch;
-			escaped = false;
-			continue;
-		}
-		if (ch === "\\" && quote !== "'") {
-			current += ch;
-			escaped = true;
-			continue;
-		}
-		if (quote) {
-			if (quote === '"' && (ch === "`" || (ch === "$" && command[i + 1] === "("))) return null;
-			current += ch;
-			if (ch === quote) quote = null;
-			continue;
-		}
-		if (ch === "'" || ch === '"') {
-			quote = ch;
-			current += ch;
-			continue;
-		}
-		// Command/process substitution is intentionally outside the conservative policy.
-		if (ch === "`" || ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(")) return null;
-		if (ch === "&" && (current.endsWith(">") || command[i + 1] === ">")) {
-			current += ch;
-			continue;
-		}
-		if (ch === "\n" || ch === ";" || ch === "|" || ch === "&") {
-			flush();
-			if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
-			continue;
-		}
-		current += ch;
-	}
-	if (quote || escaped) return null;
-	flush();
-	return segments;
-}
-
 /** Replace quoted/escaped text so literal `>` characters are not parsed as shell operators. */
 function shellSyntaxOnly(command: string): string | null {
 	let result = "";
@@ -273,7 +224,18 @@ function readOnlyCommandIssue(rawCommand: string): string | null {
 			return `output redirection is not read-only in segment: ${shortSegment(seg)}`;
 		}
 		const withoutSafeRedirections = stripSafeRedirections(seg);
+		const assignments = withoutSafeRedirections.match(/^(?:[A-Z_][A-Z0-9_]*=\S+\s+)+/)?.[0];
+		if (assignments && !assignments.trim().split(/\s+/).every(entry => /^(?:LC_ALL|LANG|LC_CTYPE)=[A-Za-z0-9_.@-]+$/.test(entry))) return "environment overrides that can change command execution are not read-only inspection";
 		const normalized = normalize(withoutSafeRedirections);
+		const special = inspectionSpecialCase(normalized);
+		if (special === true) continue;
+		if (special === false) return `unsupported inspection flags: ${shortSegment(seg)}`;
+		const words = shellWords(normalized);
+		// Git literal patterns and path arguments are data, not shell operations.
+		if (words?.[0] === "git" && SAFE_PATTERNS.some(pattern => pattern.test(normalized))) {
+			if (words.some(word => /^--(?:ext-diff|textconv|exec|output|paginate)(?:=|$)/i.test(word)) || /(?:^|\s)--paginate(?:\s|$)/.test(withoutSafeRedirections)) return `Git external execution or output option is blocked: ${shortSegment(seg)}`;
+			continue;
+		}
 		for (const pattern of DESTRUCTIVE_PATTERNS) {
 			if (pattern.test(normalized) || pattern.test(withoutSafeRedirections)) {
 				return `a blocked mutating operation appears in segment: ${shortSegment(seg)}`;
@@ -334,6 +296,45 @@ export function isApprovedReviewCheck(state: RpacState, rawCommand: string): boo
 	return true;
 }
 
+/** Native host runner policy. Approval is additional authorization, never a shell denylist bypass. */
+export function hostCommandIssue(location: string, command: string, kind: "setup" | "check"): string | null {
+	const prefix = prCheckPrefix(location);
+	if (command !== command.trim() || !command.startsWith(prefix)) return `include the exact checkout prefix ${prefix}`;
+	const suffix = command.slice(prefix.length);
+	const syntax = shellSyntaxOnly(suffix), segments = shellSegments(suffix);
+	if (syntax === null || !segments?.length || /[|;<>&(){}\n]/.test(syntax.replaceAll("&&", ""))) return "only literal commands joined by && are supported (no redirects, wrappers, substitutions or background jobs)";
+	for (const segment of segments) {
+		const words = shellWords(segment);
+		if (!words?.length) return "use literal command arguments, without variable expansion";
+		const [exe, verb, ...args] = words;
+		if (["cd", "pushd", "popd", "dirs", "env", "command", "builtin", "exec", "eval", "source", ".", "bash", "sh", "zsh", "fish", "set", "export"].includes(exe ?? "")) return "subsequent directory switches, environment wrappers and nested shells are not allowed";
+		if (words.some(arg => /^(?:-C(?:.|$)|--(?:directory|git-dir|work-tree|manifest-path)(?:=|$))/.test(arg))) return "launcher directory or repository overrides are not allowed";
+		if (kind === "setup") {
+			if (exe !== "npm" || verb !== "ci" || args.some(arg => !["--ignore-scripts", "--no-audit", "--no-fund", "--offline", "--prefer-offline", "--include=dev"].includes(arg))) return "dependency setup currently supports npm ci with standard audit/fund/offline/ignore-scripts flags only; put tests/builds in reviewChecks";
+			continue;
+		}
+		if (isReadOnlyCommand(segment)) continue;
+		if (exe === "npm" && (verb === "test" || verb === "run") && (verb !== "run" || (!!args[0] && /^[A-Za-z0-9_:.-]+$/.test(args[0])))) {
+			const options = verb === "run" ? args.slice(1) : args;
+			const beforeDelimiter = options.slice(0, options.includes("--") ? options.indexOf("--") : options.length);
+			if (beforeDelimiter.every(arg => !arg.startsWith("-") || ["--silent", "--no-audit", "--no-fund"].includes(arg))) continue;
+		}
+		if (exe === "npx" && verb === "--no-install" && !!args[0] && /^[A-Za-z0-9_.-]+$/.test(args[0])) {
+			// npx is for the project's check binary, not a second route to a
+			// forbidden shell/interpreter, package manager or host mutation CLI.
+			if (["bash", "sh", "dash", "zsh", "fish", "env", "node", "nodejs", "python", "python3", "perl", "ruby", "php", "npm", "npx", "pnpm", "yarn", "corepack", "git", "gh", "curl", "wget", "ssh", "scp", "rsync", "sudo", "rm", "cp", "mv", "install", "chmod", "chown", "tee", "sed", "awk"].includes(args[0])) return "npx must launch the screened project check binary, not a shell/interpreter/package-manager/host-mutation wrapper";
+			continue;
+		}
+		if (exe === "node" && verb && !words.some(arg => /^(?:-e|-p|-r|--eval|--print|--require|--import|--loader|--experimental-loader|--test-reporter-destination)(?:=|$)/.test(arg)) && (verb === "--test" || (!verb.startsWith("-") && !isAbsolute(verb) && !verb.split(/[\\/]/).includes("..")))) continue;
+		if (exe === "pytest") continue;
+		if (exe === "cargo" && ["test", "check", "build", "clippy"].includes(verb ?? "")) continue;
+		if (exe === "go" && ["test", "build", "vet"].includes(verb ?? "")) continue;
+		if (exe === "make" && ["test", "check", "build", "all", "lint", "typecheck"].includes(verb ?? "") && !args.some(arg => /^(?:-f|--file|--makefile|--eval)(?:=|$)/.test(arg))) continue;
+		return `unsupported or mutating launcher: ${shortSegment(segment)}. Use a reviewed project test/build script; direct installs belong in setupCommands, and shell/Git/remote mutations stay blocked`;
+	}
+	return null;
+}
+
 /** The single workflow artifact the model may write in the given phase. */
 export function allowedArtifactForPhase(root: string, workflowId: string, phase: string): string | null {
 	if (phase === "refine") return artifactFile(root, workflowId, "requirements");
@@ -352,7 +353,7 @@ export interface GateDecision {
 	reason: string;
 }
 
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "codemode", "ask_user_question"]);
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "codemode", "ask_user_question", "todo"]);
 
 /** Fail closed when RPAC files exist but active state cannot be validated. */
 export function gateUnreadableState(toolName: string): GateDecision | null {
@@ -448,11 +449,16 @@ function gateReviewToolCall(
 		if (allowed && pathIsExactly(cwd, target, allowed)) return null;
 		return {
 			block: true,
-			reason: `RPAC ${phase} is report-only: reviewed files cannot be modified. The only writable artifact is ${allowed ?? "(none)"}.`,
+			reason: allowed
+				? `RPAC ${phase} is report-only. Write only the current task ledger: ${allowed}.`
+				: `No review task is currently running, so no ledger is writable. ${state.tasks.some(task => task.status === "interrupted") ? "The run was interrupted; the user must run /rpac act <task-id> or /rpac resume before a ledger can be written." : state.approvals.sequential ? "After successful task_done, call rpac task_start with task \"next\" before inspecting or writing the next batch (a live execution lease is required)." : "Wait for the user to run /rpac act."} Reading files does not start a task.`,
 		};
 	}
 	if (toolName === "bash" || toolName === "powershell") {
 		const command = typeof input?.command === "string" ? input.command : undefined;
+		if (command !== undefined && state.review?.execution && !isReadOnlyCommand(command) && [...state.review.approvedChecks, ...state.review.execution.setupCommands].includes(command.trim())) {
+			return { block: true, reason: "This preview command needs the screened host-execution path. Call rpac review_check with the exact command; the user must separately approve execution. Do not wrap it in another shell or tool." };
+		}
 		if (command !== undefined && state.review?.pr && state.review.approvedChecks.includes(command.trim()) &&
 			(toolName !== "bash" || !isApprovedReviewCheck(state, command))) {
 			return { block: true, reason: `PR verification requires bash and a safe check in the exact approved checkout prefix: ${prCheckPrefix(state.review.pr.checkoutLocation)}. Replan unsafe checks.` };

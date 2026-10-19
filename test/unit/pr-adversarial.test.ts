@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { capturePrSnapshot, performPrCheckout, prWorktreePath, removePrWorktree, resolvePrMeta, selectPrRemote, type GhRunner } from "../../lib/pr.ts";
+import { capturePrSnapshot, performPrCheckout, prWorktreePath, removePrWorktree, resolvePrMeta, selectPrRemote, assertOwnedPrWorktree, isPrWorktreeLocation, type GhRunner } from "../../lib/pr.ts";
 import { makeTempDir, removeTree } from "../../lib/util.ts";
 
 function git(root: string, ...args: string[]): string {
@@ -81,6 +81,33 @@ test("PR checkout refuses to reuse a foreign checkout even with the expected HEA
   const wt = prWorktreePath(f.root, 1); git(f.root, "worktree", "add", "--detach", wt, f.head);
   assert.throws(() => performPrCheckout(f.root, meta(f.base, f.head), "worktree", gh, f.root), /owned|ownership/);
  } finally { f.cleanup(); }
+});
+
+test("missing registered worktrees get fresh checkouts without losing foreign, locked or staged metadata", () => {
+ for (const kind of ["owned", "foreign", "locked"]) {
+  const f = fixture(); try {
+   const base = prWorktreePath(f.root, 1);
+   if (kind === "foreign") git(f.root, "worktree", "add", "--detach", base, f.head);
+   else performPrCheckout(f.root, meta(f.base, f.head), "worktree", gh, f.root);
+   writeFileSync(join(base, "file"), "precious staged work\n"); git(base, "add", "file");
+   const admin = git(base, "rev-parse", "--absolute-git-dir"), index = readFileSync(join(admin, "index"));
+   const history = readFileSync(join(admin, "logs", "HEAD"));
+   if (kind === "locked") git(f.root, "worktree", "lock", "--reason", "preserve offline checkout", base);
+   removeTree(base);
+   const fresh = performPrCheckout(f.root, meta(f.base, f.head), "worktree", gh, f.root);
+   assert.notEqual(fresh.location, base); assert.equal(isPrWorktreeLocation(f.root, 1, fresh.location), true);
+   assert.match(fresh.output, /Preserved missing worktree registration/);
+   assertOwnedPrWorktree(f.root, 1, f.head, fresh.location);
+   assert.deepEqual(readFileSync(join(admin, "index")), index);
+   assert.deepEqual(readFileSync(join(admin, "logs", "HEAD")), history);
+   assert.ok(git(f.root, "worktree", "list", "--porcelain").includes(`worktree ${base}\n`));
+   assert.match(removePrWorktree(f.root, 1), /registration is retained/);
+   assert.match(removePrWorktree(f.root, 1, f.head, fresh.location), /removed PR worktree/);
+   assert.ok(existsSync(admin), "cleanup targets the fresh recorded path, not stale metadata");
+   if (kind === "locked") assert.ok(existsSync(join(admin, "locked")));
+   assert.throws(() => removePrWorktree(f.root, 1, f.head, base + "-not-generated"), /unexpected cleanup location/);
+  } finally { f.cleanup(); }
+ }
 });
 
 test("PR checkout fails on fetch error even when a stale local PR ref matches", () => {

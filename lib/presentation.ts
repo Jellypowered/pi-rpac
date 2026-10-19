@@ -1,6 +1,7 @@
 // Human-facing summaries. Machine results, diagnostics and saved evidence stay intact.
 import type { RpacState } from "./schema.ts";
 import { reviewCoverage } from "./machine.ts";
+import { unexecutedHostChecks } from "./execution.ts";
 
 /** Custom voices affect model prose; deterministic milestones use Natural. */
 export function progressMessage(phase: "refine" | "plan" | "act" | "consolidate", style = "natural"): string {
@@ -63,6 +64,16 @@ export function conversationalStatus(state: RpacState, style = "natural"): strin
 	if (state.tasks.some((task) => task.status === "done" && !task.verification?.length)) lines.push("Some finished tasks have no saved checks, so their results are unverified.");
 	if (state.tasks.some((task) => task.acceptedException)) lines.push("Some tasks were accepted with an exception. That does not mean every check passed.");
 	if (state.tasks.some((task) => task.issues?.length)) lines.push("Read the recorded issues or deviations in the details before relying on the result.");
+	const execution = review?.execution;
+	if (execution) {
+		const missing = unexecutedHostChecks(state).length;
+		if (missing) lines.push(`${missing} planned host ${missing === 1 ? "check has" : "checks have"} no completed execution evidence for this plan. Those runtime results are unverified.`);
+		const pending = execution.runs.filter(run => !checks.some(check => check.name === run.command && check.result === run.result && check.detail?.includes(run.output?.path ?? "(no log)")));
+		if (pending.some(run => run.result === "fail")) lines.push("A recorded host command failed. Read its log before relying on the result.");
+		if (pending.some(run => run.result === "unavailable" || run.result === "running")) lines.push("A host command has no verified completion; do not assume it passed.");
+		if (execution.screening?.recommendation === "do-not-run") lines.push("The script review recommends not running this code. Resolve the reported safety concerns before requesting execution.");
+		else if (!ended && !state.paused && execution.screening && !execution.approval) lines.push("Host execution is not approved yet. Read the script screening and risks with /rpac approve execution before running code. Source inspection can continue without that approval.");
+	}
 	if (coverage) {
 		lines.push(`The saved review evidence covers ${coverage.covered} of ${coverage.total} items.${coverage.uncovered.length ? ` ${coverage.uncovered.length} ${coverage.uncovered.length === 1 ? "item still needs" : "items still need"} review, so the assessment is incomplete.` : ""}`);
 		if (review!.drift) lines.push("The files or review conditions changed, or could not be verified, during the review (review drift). Earlier results cannot be trusted for the affected parts. This is not a clean review.");
