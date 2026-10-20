@@ -49,7 +49,10 @@ For code execution, `plan_complete` must include:
   present lockfiles and .npmrc for npm/npx recipes. `risks` must honestly discuss unreviewed code and host access.
 
 Plan approval is **not host-execution approval**. Ask the user to inspect the screening and run `/rpac approve execution`
-(headless: `/rpac approve execution --yes`). The dialog discloses commands, files/hashes, risks and output directories.
+(headless: `/rpac approve execution --yes`). Terminal review supports arrow/page/Home/End keys (and fullscreen mouse-wheel
+scrolling), then Enter opens a short confirmation where only Y grants consent. Esc cancels. Commands, files/hashes,
+risks and outputs remain in the complete content-addressed `host-execution-review-*.txt` dossier. RPC confirmation
+points to that file instead of embedding a huge list; the user must inspect it before confirming.
 A `do-not-run` recommendation cannot be approved. Changed plan, inputs, checkout identity, scope or commands require
 new screening/approval. Never approve yourself or bypass a refusal with another tool, wrapper or shell.
 

@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import type { ExecutionInput } from "../../lib/execution.ts";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, dirname, sep, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import rpacExtension from "../../extensions/rpac.ts";
@@ -294,6 +294,58 @@ test("preview rejects impossible checks and contradictory written assignments be
   writeArtifact(env.work, "plan", PLAN + `\n### Task 1 — Review all\nAssigned manifest items:\n- ${state.review.scopeItemIds[0]}\n\n`, id);
   assert.match(await rpacTool(m, env.work, { action: "plan_complete", tasks, reviewChecks: [prefix + "node --version"] }), /different manifest items/);
   assert.equal(readState(env.work).approvals.plan, false);
+ } finally { env.cleanup(); }
+});
+
+test("large execution reviews use scrollable TUI, bounded RPC consent and immutable full evidence", async () => {
+ const env = setupPrEnv(), m = makeMockPi();
+ try {
+  git(env.origin, "checkout", "feature"); mkdirSync(join(env.origin, "screened"));
+  const files = Array.from({ length: 40 }, (_, i) => `screened/input-${i}.txt`);
+  for (const file of files) writeFileSync(join(env.origin, file), "controlled audit fixture\n");
+  writeFileSync(join(env.origin, "verify.cjs"), "console.log('fixture');\n");
+  git(env.origin, "add", "."); git(env.origin, "commit", "-qm", "large screening fixture");
+  const head = git(env.origin, "rev-parse", "HEAD"); git(env.origin, "update-ref", "refs/pull/1/head", head); git(env.origin, "checkout", env.baseRef);
+  env.setView({ ...env.view, headRefOid: head });
+  rpacExtension(extensionApiFor(m)); await rpacCmd(m, env.work, "preview 1");
+  const checkout = readState(env.work).review.pr.checkoutLocation, command = prCheckPrefix(checkout) + "node verify.cjs";
+  await driveToAct(m, env.work, command, { screening: { summary: "Inspected the controlled fixture script and forty text inputs. The script only prints fixture text. This source assessment does not prove host or dependency safety and does not authorize execution.", files: ["verify.cjs", ...files], risks: ["Host files, credentials, network and shared Git remain accessible."], recommendation: "run" } });
+  const declined = await rpacCmd(m, env.work, "approve execution", { confirm: [false] });
+  assert.equal(declined.ui.confirmations.length, 0, "no unscrollable native TUI confirmation");
+  assert.equal(declined.ui.customScreens.length, 1);
+  assert.ok(declined.ui.customScreens[0].length <= 24);
+  assert.match(declined.ui.customScreens[0].at(-1)!, /Esc:cancel/);
+  assert.equal(readState(env.work).review.execution.approval, undefined);
+  const dir = workflowDirPath(env.work), name = readdirSync(dir).find(name => name.startsWith("host-execution-review-"))!;
+  const path = join(dir, name), full = readFileSync(path, "utf8");
+  assert.ok(full.includes(command));
+  for (const file of files) assert.ok(full.includes(file), file);
+  assert.match(full, /Inspected files \(41\)/);
+  assert.ok(full.indexOf(command) < full.indexOf("Inspected files"), "commands/risks precede the long inventory");
+  const rpc = await rpacCmd(m, env.work, "approve execution", { mode: "rpc", confirm: [false] });
+  assert.equal(rpc.ui.customScreens.length, 0);
+  assert.equal(rpc.ui.confirmations.length, 1);
+  assert.ok(rpc.ui.confirmations[0].message.length < 900);
+  assert.ok(rpc.ui.confirmations[0].message.includes(name));
+  assert.match(rpc.ui.confirmations[0].message, /NOT a sandbox/);
+  assert.equal(readFileSync(path, "utf8"), full);
+  // Consent does not bypass changes made while the user was reviewing.
+  for (const target of [join(checkout, "verify.cjs"), path]) {
+   const before = readFileSync(target);
+   const ctx = makeCommandCtx(m, env.work);
+   ctx.ui.custom = (async () => { writeFileSync(target, "changed during review\n"); return true; }) as any;
+   await m.commands.get("rpac")!.handler("approve execution", ctx);
+   assert.match(ctx.ui.text("error").join("\n"), /changed/);
+   assert.equal(readState(env.work).review.execution.approval, undefined);
+   writeFileSync(target, before);
+  }
+  const approved = await rpacCmd(m, env.work, "approve execution", { confirm: [true] });
+  assert.equal(approved.ui.text("error").length, 0, approved.ui.text("error").join("\n"));
+  assert.equal(approved.ui.customScreens.length, 2);
+  assert.match(approved.ui.customScreens[1].at(-1)!, /Y:allow/);
+  const record = JSON.parse(readFileSync(join(env.work, readState(env.work).review.execution.approval.record.path), "utf8"));
+  assert.ok(record.review.path.endsWith(name));
+  assert.equal(record.review.sha256, name.slice("host-execution-review-".length, -4));
  } finally { env.cleanup(); }
 });
 

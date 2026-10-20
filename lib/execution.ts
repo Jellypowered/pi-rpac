@@ -1,10 +1,11 @@
 // Explicitly authorized host execution for PR previews. This is NOT a sandbox or malware detector.
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { RpacState, VerificationCheck } from "./schema.ts";
 import { hostCommandIssue, prCheckPrefix, isReadOnlyCommand } from "./gating.ts";
-import { sha256File } from "./util.ts";
+import { atomicWriteFile, sha256File } from "./util.ts";
+import { relArtifactPath, workflowDir } from "./paths.ts";
 import { shellSegments, shellWords } from "./shell.ts";
 
 export interface ScreeningInput {
@@ -120,5 +121,24 @@ export function requireRuntimeEvidence(state: RpacState, additional: Verificatio
 
 export function hostApprovalText(state: RpacState): string {
 	const execution = state.review!.execution!, s = execution.screening!;
-	return `Execute reviewed PR commands ON THIS HOST? A separate checkout is NOT a sandbox. Code and dependencies can access host files, credentials, network and shared Git administration. Screening is a model assessment, NOT proof of safety. Approval trusts this code with your user account's access. npm ci may run dependency lifecycle hooks unless --ignore-scripts is used; downloaded dependency code is not exhaustively screened.\n\nCheckout: ${state.review!.pr!.checkoutLocation}\n\nScreening:\n${s.summary}\n\nInspected files:\n${s.files.map(file => `${file.path} (${file.sha256})`).join("\n")}\n\nRisks/limitations:\n${s.risks.join("\n") || "No specific risks reported; arbitrary/dependency code remains unproven."}\n\nSetup (network expected):\n${execution.setupCommands.join("\n") || "none"}\n\nChecks/builds (expected offline; host networking is NOT mechanically restricted):\n${state.review!.approvedChecks.join("\n") || "none"}\n\nExpected untracked output directories: ${execution.generatedPaths.join(", ") || "none"}. Tracked source edits are never hidden. No automatic cleanup or GitHub publishing. Approval covers only these exact commands and this plan/screening; changed inputs require fresh approval.`;
+	return `Execute reviewed PR commands ON THIS HOST? A separate checkout is NOT a sandbox. Code and dependencies can access host files, credentials, network and shared Git administration. Screening is a model assessment, NOT proof of safety. Approval trusts this code with your user account's access. npm ci may run dependency lifecycle hooks unless --ignore-scripts is used; downloaded dependency code is not exhaustively screened.\n\nCheckout: ${state.review!.pr!.checkoutLocation}\n\nScreening:\n${s.summary}\n\nRisks/limitations:\n${s.risks.join("\n") || "No specific risks reported; arbitrary/dependency code remains unproven."}\n\nSetup (network expected):\n${execution.setupCommands.join("\n") || "none"}\n\nChecks/builds (expected offline; host networking is NOT mechanically restricted):\n${state.review!.approvedChecks.join("\n") || "none"}\n\nExpected untracked output directories: ${execution.generatedPaths.join(", ") || "none"}. Tracked source edits are never hidden. No automatic cleanup or GitHub publishing. Approval covers only these exact commands and this plan/screening; changed inputs require fresh approval.\n\nWorkflow: ${state.id}\nPR head: ${state.review!.pr!.headSha}\nPlan SHA-256: ${state.artifacts.plan!.sha256}\nRecipe: ${executionDigest(state)}\n\nInspected files (${s.files.length}):\n${s.files.map(file => `${file.path} (${file.sha256})`).join("\n")}`;
+}
+
+/** Content-addressed, complete pre-consent dossier; never overwrite prior evidence. */
+export function writeHostReview(root: string, state: RpacState): { text: string; path: string; sha256: string } {
+	const text = hostApprovalText(state) + "\n";
+	const sha256 = createHash("sha256").update(text).digest("hex");
+	const path = join(workflowDir(root, state.id), `host-execution-review-${sha256}.txt`);
+	let existing: Stats | undefined;
+	try { existing = lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	if (existing) {
+		if (existing.isSymbolicLink() || !existing.isFile() || sha256File(path) !== sha256) throw new Error("Saved host-execution review differs from its content identity; preserving it and refusing approval.");
+	} else atomicWriteFile(path, text);
+	return { text, path: relArtifactPath(root, path), sha256 };
+}
+
+/** Bounded consent text: full commands/risks/inventory remain in the review, not this prompt. */
+export function hostApprovalConfirmation(state: RpacState, reviewPath: string): string {
+	const execution = state.review!.execution!;
+	return `NOT a sandbox. Allow this PR code your account's host access: files, credentials, network and shared Git. Screening is NOT proof of safety; offline hints do NOT restrict networking.\n\nRecipe ${executionDigest(state).slice(0, 12)}: ${execution.setupCommands.length} setup, ${state.review!.approvedChecks.length} checks, ${execution.screening!.files.length} inspected files.\nRead the full commands, risks and outputs first:\n${reviewPath}\n\nApprove only this exact screened recipe?`;
 }

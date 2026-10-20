@@ -24,7 +24,8 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveStyle, stylePaths, parseStyleCommand, saveStylePreference, styleReport, styleCompletions, styleInstruction } from "../lib/styles.ts";
 import { progressMessage, statusOpening, nextStep, conversationalStatus, humanError, approvalExplanation } from "../lib/presentation.ts";
 import { validateReviewAssignments } from "../lib/review-plan.ts";
-import { prepareHostExecution, assertScreeningCurrent, assertHostApproval, executionDigest, hostApprovalText, requireRuntimeEvidence } from "../lib/execution.ts";
+import { HostApprovalView } from "../lib/approval-ui.ts";
+import { prepareHostExecution, assertScreeningCurrent, assertHostApproval, executionDigest, writeHostReview, hostApprovalConfirmation, requireRuntimeEvidence } from "../lib/execution.ts";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -1514,16 +1515,24 @@ export default function rpacExtension(pi: ExtensionAPI, gh: GhRunner = defaultGh
 					if (!state?.review?.pr || !["plan", "act"].includes(state.phase)) throw new RpacGuardError("Host execution approval requires an active PR preview with a finalized plan and screening.");
 					assertScreeningCurrent(root, state);
 					assertPrCheckout(root, state.review.pr, state.review.execution!.generatedPaths);
-					const digest = executionDigest(state), explanation = hostApprovalText(state);
-					const approved = ctx.hasUI ? await ctx.ui.confirm("Allow these screened PR commands on this host?", explanation) : tokens.includes("--yes");
-					if (!approved) throw new RpacGuardError(`${explanation}\n\nHost execution not approved. Read the screening and risks first. Headless approval: /rpac approve execution --yes. Source-only review may continue.`);
+					const digest = executionDigest(state), review = writeHostReview(root, state);
+					const confirmation = hostApprovalConfirmation(state, review.path);
+					const approved = ctx.hasUI
+						? ctx.mode === "tui"
+							? await ctx.ui.custom<boolean>((tui, theme, _keys, done) => new HostApprovalView(review.text, confirmation,
+								() => Math.floor(tui.terminal.rows * 0.8), () => tui.requestRender(), done, text => theme.fg("warning", text)),
+								{ overlay: true, overlayOptions: { width: "95%", maxHeight: "90%", margin: 0 } })
+							: await ctx.ui.confirm("Allow screened PR code on this host?", confirmation)
+						: tokens.includes("--yes");
+					if (!approved) throw new RpacGuardError(`Host execution not approved. NOT a sandbox; review commands and risks in ${review.path}. Headless consent requires /rpac approve execution --yes. Source-only review may continue.`);
 					const current = loadActive(root, root).state;
 					if (!current || current.id !== state.id || executionDigest(current) !== digest) throw new RpacGuardError("Screening changed while approval was pending. Review it again.");
 					assertScreeningCurrent(root, current);
+					if (sha256File(join(root, review.path)) !== review.sha256) throw new RpacGuardError("Full execution review changed while approval was pending. Review it again.");
 					assertPrCheckout(root, current.review!.pr!, current.review!.execution!.generatedPaths);
 					const at = nowIso(), recordPath = join(workflowDir(root, state.id), `host-approval-${shortId()}.json`);
 					if (existsSync(recordPath)) throw new RpacGuardError("Approval evidence path already exists; preserving it. Retry approval to allocate a new record.");
-					atomicWriteFile(recordPath, JSON.stringify({ version: 1, at, digest, workflow: state.id, plan: current.artifacts.plan, scopeFingerprint: current.review!.fingerprint, pr: current.review!.pr, execution: { ...current.review!.execution, approval: undefined, runs: undefined }, checks: current.review!.approvedChecks, network: "Setup network expected; checks expected offline. Host network is not sandboxed." }, null, 2) + "\n");
+					atomicWriteFile(recordPath, JSON.stringify({ version: 1, at, digest, review: { path: review.path, sha256: review.sha256 }, workflow: state.id, plan: current.artifacts.plan, scopeFingerprint: current.review!.fingerprint, pr: current.review!.pr, execution: { ...current.review!.execution, approval: undefined, runs: undefined }, checks: current.review!.approvedChecks, network: "Setup network expected; checks expected offline. Host network is not sandboxed." }, null, 2) + "\n");
 					const record = { path: relArtifactPath(root, recordPath), sha256: sha256File(recordPath) };
 					updateActive(root, s => { if (s.id !== state.id || executionDigest(s) !== digest) throw new RpacGuardError("Execution recipe changed during approval."); s.review!.execution!.approval = { at, digest, record }; recordEvent(s, "host_execution_approved", `user approved screened host recipe; no sandbox; record ${record.path} (${record.sha256})`); });
 					appendLog(root, state.id, `- **${at}** host approval evidence: ${record.path} (${record.sha256}); digest ${digest}`);

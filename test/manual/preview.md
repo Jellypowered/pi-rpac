@@ -71,6 +71,14 @@ not proof of tone quality, injection resistance, or a complete long-running PR r
    stop host execution.
 3. Before `/rpac approve execution`, confirm a native script/setup request refuses without executing
    anything. Decide personally whether to consent; this manual checklist is not authorization.
+   With a large inspected-file list, verify terminal approval has an always-visible footer; scroll
+   to the last inventory entry with End and back with Home/PageUp/arrows/wheel. Resize from 80×24
+   to 40×12 and verify content remains reachable. Enter should open short confirmation, never grant
+   consent by itself. Y grants consent only after that screen renders; B returns, Esc cancels both
+   screens. RPC should show a compact confirmation pointing to the complete saved review file.
+   Changing that file or a screened source while consent is pending must invalidate approval.
+   A display-only fixture exercised End/Home, resizing, cancel and explicit approval through actual
+   pseudo-terminals on development Pi 1.1.0 and installed Pi 1.3.0; no subject code was executed.
 4. If consented, run early setup and supported checks through `rpac review_check`. Inspect full logs,
    real exit codes, offline hints and generated outputs. Do not substitute a deferred test for a pass.
    An interrupted/uncertain command must block blind replay.

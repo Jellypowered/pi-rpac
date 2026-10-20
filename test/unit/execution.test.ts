@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, symlinkSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { newReviewState, validateState, RPAC_PREVIEW_STATE_VERSION, type PrReviewMeta } from "../../lib/schema.ts";
-import { prepareHostExecution, parseHostExecution, executionDigest, assertHostApproval, assertScreeningCurrent, generatedPath, hostApprovalText, unexecutedHostChecks, requireRuntimeEvidence, type ExecutionInput } from "../../lib/execution.ts";
+import { prepareHostExecution, parseHostExecution, executionDigest, assertHostApproval, assertScreeningCurrent, generatedPath, hostApprovalText, writeHostReview, unexecutedHostChecks, requireRuntimeEvidence, type ExecutionInput } from "../../lib/execution.ts";
 import { hostCommandIssue, prCheckPrefix } from "../../lib/gating.ts";
 import { cleanPrStatus } from "../../lib/pr.ts";
 import { makeTempDir, removeTree, sha256File } from "../../lib/util.ts";
@@ -43,6 +43,22 @@ test("screening is bounded declarative evidence, not user approval; state round-
 	assert.deepEqual(unexecutedHostChecks(state), checks);
 	assert.throws(() => requireRuntimeEvidence(state, [{ name: checks[0], kind: "observation", result: "pass", detail: "deferred to later" }]), /do not report a planned\/deferred test as pass/);
 	assert.doesNotThrow(() => requireRuntimeEvidence(state, [{ name: checks[0], kind: "observation", result: "unavailable", detail: "User did not authorize host execution; these tests were not run." }]));
+}));
+
+test("full approval reviews are immutable evidence, never consent, including dangling symlinks", () => fixture((root, state, input, checks) => {
+	state.review!.execution = prepareHostExecution(state, checks, input);
+	mkdirSync(join(root, ".pi", "rpac", state.id), { recursive: true });
+	const before = JSON.stringify(state), review = writeHostReview(root, state), path = join(root, review.path);
+	assert.equal(sha256File(path), review.sha256);
+	assert.ok(readFileSync(path, "utf8").includes(checks[0]));
+	assert.deepEqual(writeHostReview(root, state), review);
+	writeFileSync(path, "tampered evidence");
+	assert.throws(() => writeHostReview(root, state), /preserving it and refusing approval/);
+	assert.equal(readFileSync(path, "utf8"), "tampered evidence");
+	unlinkSync(path); symlinkSync(join(root, "nonexistent"), path);
+	assert.throws(() => writeHostReview(root, state), /refusing approval/);
+	assert.equal(lstatSync(path).isSymbolicLink(), true);
+	assert.equal(JSON.stringify(state), before);
 }));
 
 test("approval is bound to source bytes, plan, commands, outputs and scope", () => fixture((root, state, input, checks) => {

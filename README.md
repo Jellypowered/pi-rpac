@@ -84,7 +84,7 @@ for exact current, staged, or full Git scope.
 - Any model configured in Pi, including local models over OpenAI-compatible endpoints. No hosted
   model or new provider is required.
 
-Host-provided packages `@earendil-works/pi-coding-agent` and `typebox` are declared as
+Host-provided packages `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` and `typebox` are declared as
 `peerDependencies` and are supplied by Pi at runtime — you don't install them for the extension
 to run.
 
@@ -496,6 +496,17 @@ screening and grant separate consent:
 /rpac approve execution --yes     # explicit consent for a headless caller
 /rpac act --sequential
 ```
+
+In the terminal, the full approval review is scrollable with **↑/↓**, **PageUp/PageDown**,
+**Home/End** (plus mouse wheel in fullscreen mode). **Enter** opens a short confirmation; only **Y** approves.
+**B** returns to the full review, and **Esc** cancels from either screen. Controls remain visible
+when the terminal resizes; very small terminals cannot approve until enlarged. Commands and risks
+appear before the long file/hash inventory, and nothing is silently omitted.
+
+The complete review is also saved as `host-execution-review-<sha256>.txt` in the workflow directory.
+RPC clients receive a short confirmation pointing to that file; read it before confirming. Headless
+callers still need explicit `--yes`. Approval records retain the review file's path/hash, and inputs
+and the review are revalidated after the user responds.
 
 The model runs registered recipes through `rpac review_check`, not raw shell:
 - Setup is expected to use the network; checks/builds are expected to avoid external network use.

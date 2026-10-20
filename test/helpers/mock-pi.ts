@@ -13,6 +13,8 @@ export interface MockUI {
 	statuses: Record<string, string | undefined>;
 	widgets: Record<string, string[] | undefined>;
 	confirmations: { title: string; message: string }[];
+	customScreens: string[][];
+	custom<T>(factory: (tui: any, theme: any, keys: any, done: (result: T) => void) => any): Promise<T>;
 	/** queued answers for confirm(); default true when the queue is empty */
 	confirmQueue: boolean[];
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -28,6 +30,20 @@ export function makeUI(confirmDefault = true): MockUI {
 		statuses: {},
 		widgets: {},
 		confirmations: [],
+		customScreens: [],
+		async custom<T>(factory: (tui: any, theme: any, keys: any, done: (result: T) => void) => any): Promise<T> {
+			let result: T | undefined, completed = false;
+			const component = await factory({ terminal: { rows: 24 }, requestRender() {} }, { fg: (_color: string, text: string) => text }, {}, (value: T) => { completed = true; result = value; });
+			ui.customScreens.push(component.render(80));
+			const approved = ui.confirmQueue.length > 0 ? ui.confirmQueue.shift()! : confirmDefault;
+			if (approved) {
+				component.handleInput("\r");
+				ui.customScreens.push(component.render(80));
+				component.handleInput("y");
+			} else component.handleInput("\x1b");
+			if (!completed) throw new Error("Mock custom approval did not resolve via explicit user input");
+			return result as T;
+		},
 		confirmQueue: [],
 		notify(message, type) {
 			ui.notifications.push({ message, type });

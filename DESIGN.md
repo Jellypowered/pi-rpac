@@ -69,7 +69,8 @@ duplicate Pi's native mechanisms and lose approval/state enforcement.
   release and honest interruption recording (see §2.5).
 - `ctx.newSession({withSession})` — explicit fresh-session handoff.
 - Node 22.22 strips TS types natively → tests run with `node --test` on `.ts` files, zero
-  runtime deps. `typebox` and `@earendil-works/pi-coding-agent` are host-provided
+  separately installed runtime deps. `typebox`, `@earendil-works/pi-coding-agent` and
+  `@earendil-works/pi-tui` are host-provided
   (peerDependencies) — devDependencies only for local type-check/tests.
 
 ## 2. Architecture
@@ -87,6 +88,7 @@ pi-rpac/
 │   ├── shell.ts          # literal shell segments/words; no evaluation
 │   ├── review-plan.ts    # explicit written/registered assignment agreement
 │   ├── execution.ts      # screened host consent, input hashes, native evidence policy
+│   ├── approval-ui.ts    # height-bounded audit viewport + explicit terminal consent
 │   ├── git.ts            # ordinary baseline/divergence detection (excludes .pi/)
 │   ├── review.ts         # byte-safe Git snapshots, manifests, fingerprints, drift (pure)
 │   ├── pr.ts             # GitHub PR review: gh resolution, safe checkout, base...head scope (pure)
@@ -252,7 +254,14 @@ a mock CLI (no network, no real GitHub).
   explicit assigned-ID blocks that disagree with registered `reviewItemIds` (`lib/review-plan.ts`).
   A `do-not-run` recommendation cannot be approved. `/rpac approve execution` is distinct from
   plan approval, needs `--yes` headlessly, and writes a hashed consent artifact with commands,
-  screening, identities and risks. The digest binds the profile version, plan, scope, PR/head,
+  screening, identities and risks. Terminal approval uses a height-bounded `ScrollView`-backed
+  overlay, with fixed controls, keyboard/wheel navigation and a separate short confirmation stage.
+  Enter never grants consent; Y only grants it after that screen renders. Esc/Ctrl-C cancel;
+  tiny terminals cannot grant consent. The complete content-addressed pre-consent review stays on
+  disk, with commands/risks before the file/hash inventory. RPC uses a bounded supported confirm
+  dialog pointing to that file, not a terminal component. Headless --yes remains explicit.
+  The approval JSON binds the review path/hash; both review and recipe are rechecked after input.
+  The digest binds the profile version, plan, scope, PR/head,
   commands, inspected hashes and output directories. It is revalidated before every dispatch.
   `rpac review_check` requires this runtime's ACT lease and an in-progress task; only it launches
   the registered code. Setup initially supports constrained `npm ci`. Checks use bounded
@@ -327,7 +336,7 @@ Task statuses: `pending → in_progress → done | failed | blocked | interrupte
 - **Sequential mode** (user-approved): only a verified pass permits `task_start` for the next
   ready task within the same lease. One-task mode and fail/blocked/interrupted outcomes reject
   continuation mechanically until the user starts a new `/rpac act` cycle.
-- Approvals are **user-only**: UI confirm dialog when `hasUI`, else `/rpac approve <what>`
+- Ordinary approvals are **user-only**: UI confirm dialog when `hasUI`, else `/rpac approve <what>`
   (headless). Thin (under-specified) requirements cannot be finalized **or** approved.
 - Gates enforced in **both** the command handlers and the `rpac` tool (defense in depth).
 
